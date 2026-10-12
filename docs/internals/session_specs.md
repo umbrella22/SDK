@@ -225,7 +225,10 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
   位（SUSPEND/HIBERNATE/REBOOT/SHUTDOWN，manager 级动作，不依赖会话），若此
   时 ScreenSaver 也可达则再加 LOCK（lock 的 Tier-2 就是它）；仅
   `org.freedesktop.ScreenSaver` 可达 → 只有 `Capability::LOCK`；两条总线皆
-  不可达（如容器、`dbus-run-session` 沙箱）→ 空集。
+  不可达（如容器、`dbus-run-session` 沙箱）→ 空集。`LOGOUT` 还有一个独立
+  接收方：GNOME/KDE/XFCE 桌面会话管理器（`logout()` 的 Tier-3 兜底，探测与
+  执行体拨同一组服务名）——logind 解析不出调用者会话但桌面会话管理器可达的
+  传统 X11 桌面，`LOGOUT`/`SESSION_MANAGEMENT` 照常置位。
 - Windows 后端仍无条件上报全部七位：Win10/11 都有这四个 API，接收方恒可达；
   权限是运行时问题（1300/1314），不是能力问题。
 - 非 Linux / 非 Windows 目标：`capabilities()` 返回空集，六个动作一律

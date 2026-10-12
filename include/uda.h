@@ -427,8 +427,10 @@ int32_t uda_media_send_command(int32_t command);
  * be resolvable: lock-session and logout speak to the caller's own logind
  * session object, so a daemon that runs sessionless (or can only see other
  * users' sessions, as on a systemd-enabled WSL2 host) answers with the power
- * bits alone. Windows reboot and shutdown can likewise fail at attempt time
- * when the caller lacks the SeShutdownPrivilege.
+ * bits alone - unless a desktop session manager (GNOME/KDE/XFCE) is reachable
+ * on the session bus, which claims the logout pair on its own, as on a
+ * traditional X11 desktop. Windows reboot and shutdown can likewise fail at
+ * attempt time when the caller lacks the SeShutdownPrivilege.
  *
  * @param out_capabilities  Receives the bitmask. Must not be null.
  * @return UDA_OK on success, otherwise a negative status code.

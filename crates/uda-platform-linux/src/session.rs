@@ -46,10 +46,11 @@
 //! answers on the system bus *and* can resolve the calling session (the
 //! `session/auto` object `loginctl lock-session` speaks to), the power
 //! actions alone when the daemon runs without a caller-attributable session
-//! (the systemd-enabled WSL2 shape), `LOCK` alone when only the session
-//! bus's ScreenSaver answers, and nothing when neither bus answers (a
-//! `dbus-run-session` sandbox). The probe runs once per process and is
-//! cached, the same trade the wake-lock backend makes.
+//! (the systemd-enabled WSL2 shape), the logout pair when only a desktop
+//! session manager is reachable (a traditional X11 desktop), `LOCK` alone
+//! when only the session bus's ScreenSaver answers, and nothing when neither
+//! bus answers (a `dbus-run-session` sandbox). The probe runs once per
+//! process and is cached, the same trade the wake-lock backend makes.
 //!
 //! Whatever the probe said, an action that is attempted and then not delivered
 //! (logind refusing or timing out, `loginctl` exiting nonzero) reports
@@ -72,7 +73,7 @@ use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
-use crate::wakelock::{logind_present, screensaver_present};
+use crate::wakelock::{bus_has_service, logind_present, screensaver_present};
 use crate::DBUS_TIMEOUT;
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
@@ -509,16 +510,16 @@ fn not_delivered(detail: impl std::fmt::Display) -> UdaError {
 
 /// Which session receivers are reachable, probed once per process.
 ///
-/// Returns `(logind, logind_session, screen_saver)`, cached in a
-/// process-wide [`OnceLock`]: receivers are not installed mid-session, while
-/// `capabilities()` sits on the hot path (the core `perform` guard consults
-/// it before *every* action), so one bounded probe triple per process beats a
-/// bus round trip per query. A receiver that appears later is only noticed
-/// after a restart, which errs in the honest direction: something
+/// Returns `(logind, logind_session, screen_saver, desktop_logout)`, cached
+/// in a process-wide [`OnceLock`]: receivers are not installed mid-session,
+/// while `capabilities()` sits on the hot path (the core `perform` guard
+/// consults it before *every* action), so one bounded probe round per process
+/// beats bus round trips per query. A receiver that appears later is only
+/// noticed after a restart, which errs in the honest direction: something
 /// unadvertised stays unavailable, never the reverse. A probe failure caches
 /// as "absent"; see [`probe_reachable`].
-fn session_reachability() -> (bool, bool, bool) {
-    static REACHABLE: OnceLock<(bool, bool, bool)> = OnceLock::new();
+fn session_reachability() -> (bool, bool, bool, bool) {
+    static REACHABLE: OnceLock<(bool, bool, bool, bool)> = OnceLock::new();
     *REACHABLE.get_or_init(|| {
         let logind = probe_reachable(crate::sync::run_async(logind_present()), "logind");
         let logind_session = if logind {
@@ -531,11 +532,21 @@ fn session_reachability() -> (bool, bool, bool) {
         } else {
             false
         };
+        let desktop_logout = if logind_session {
+            // `LOGOUT` is already claimed by the caller-session path; skip
+            // the session-bus round trip for the desktop managers.
+            false
+        } else {
+            probe_reachable(
+                crate::sync::run_async(desktop_logout_manager_present()),
+                "desktop logout managers",
+            )
+        };
         let screen_saver = probe_reachable(
             crate::sync::run_async(screensaver_present()),
             "screen saver",
         );
-        (logind, logind_session, screen_saver)
+        (logind, logind_session, screen_saver, desktop_logout)
     })
 }
 
@@ -593,6 +604,33 @@ async fn logind_session_present() -> Result<bool, UdaError> {
     }
 }
 
+/// Is a desktop session manager with a logout entry point on the session bus?
+///
+/// `logout()` falls back to the desktop's own session manager whenever the
+/// logind path fails, so those managers make `LOGOUT` claimable even where
+/// logind cannot resolve a caller session: a traditional X11 desktop that
+/// predates seat attribution has exactly such a manager and no logind
+/// session. The probe re-dials the same well-known services the fallback
+/// dials, through the shared [`bus_has_service`]; only name ownership is
+/// checked, since a wire-level refusal stays attempt-time territory (polkit,
+/// desktop policy). Bounded by [`DBUS_TIMEOUT`] per candidate and folding to
+/// "absent" like every other probe.
+async fn desktop_logout_manager_present() -> Result<bool, UdaError> {
+    let connection = LinuxSessionManager::session_connection().await?;
+    for candidate in LOGOUT_CANDIDATES {
+        if bus_has_service(
+            &connection,
+            "building the session bus daemon proxy",
+            candidate.service,
+        )
+        .await?
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Collapse a bridged probe into a plain bool.
 ///
 /// The sync bridge wraps the probe's own `Result`, so there are two failure
@@ -617,20 +655,29 @@ fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &s
 /// the power actions go straight to the manager, so any reachable logind
 /// claims them; the session-management actions resolve the **calling**
 /// session (`TerminateSession("")`, the `session/auto` object behind
-/// `loginctl lock-session`), so they need the caller-session probe, not just
-/// the daemon; and `LOCK` has two receivers - the screen saver on the
-/// session bus and the caller-session logind path - so either one claims it.
-/// With neither receiver answering (a `dbus-run-session` sandbox), nothing
-/// is claimed. The desktop logout managers are tried opportunistically
-/// rather than probed, so `LOGOUT` never rides on them.
-fn session_capability_set(logind: bool, logind_session: bool, screen_saver: bool) -> Capability {
+/// `loginctl lock-session`), so they need either the caller-session probe or
+/// a desktop session manager - `logout()` itself falls back to the GNOME/KDE/
+/// XFCE managers when logind cannot deliver, and a traditional X11 desktop
+/// that predates seat attribution has exactly that manager and no caller
+/// session; and `LOCK` has two receivers, the screen saver on the session bus
+/// and the caller-session logind path, so either one claims it. With no
+/// receiver answering (a `dbus-run-session` sandbox), nothing is claimed.
+fn session_capability_set(
+    logind: bool,
+    logind_session: bool,
+    screen_saver: bool,
+    desktop_logout: bool,
+) -> Capability {
     let mut capabilities = Capability::empty();
 
     if logind {
         capabilities |=
             Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
     }
-    if logind_session {
+    // The two session-management bits are two views of one condition: some
+    // receiver can deliver a logout, whether the logind caller-session path
+    // or a desktop session manager.
+    if logind_session || desktop_logout {
         capabilities |= Capability::SESSION_MANAGEMENT | Capability::LOGOUT;
     }
     if logind_session || screen_saver {
@@ -681,8 +728,8 @@ impl SessionManager for LinuxSessionManager {
         // WSL2) answers with the power actions alone. Whether logind
         // *authorises* the caller remains a runtime question for the methods
         // above, not a capability question.
-        let (logind, logind_session, screen_saver) = session_reachability();
-        session_capability_set(logind, logind_session, screen_saver)
+        let (logind, logind_session, screen_saver, desktop_logout) = session_reachability();
+        session_capability_set(logind, logind_session, screen_saver, desktop_logout)
     }
 }
 
@@ -904,7 +951,7 @@ mod tests {
         // the session objects receive the session-management ones, so both
         // quadrants with a live session claim all seven bits.
         for screen_saver in [true, false] {
-            let capabilities = session_capability_set(true, true, screen_saver);
+            let capabilities = session_capability_set(true, true, screen_saver, false);
 
             assert!(
                 capabilities.contains(Capability::SESSION_MANAGEMENT),
@@ -935,7 +982,7 @@ mod tests {
         // `loginctl lock-session` nor `TerminateSession("")` can resolve the
         // calling session, so the session bits stay unadvertised. The
         // manager-level power actions keep their receiver.
-        let capabilities = session_capability_set(true, false, false);
+        let capabilities = session_capability_set(true, false, false, false);
 
         for action in [
             SessionAction::Suspend,
@@ -965,7 +1012,7 @@ mod tests {
         // The bits compose: `lock()` tries the screen saver before any
         // `loginctl` call, so a reachable screen saver claims LOCK even when
         // logind has no session for the caller.
-        let capabilities = session_capability_set(true, false, true);
+        let capabilities = session_capability_set(true, false, true, false);
 
         for action in [
             SessionAction::Suspend,
@@ -990,7 +1037,7 @@ mod tests {
         // loginctl CLI tier is gone with it; the desktop logout managers are
         // tried opportunistically, never probed. Only the screen-saver lock is
         // honestly claimable.
-        let capabilities = session_capability_set(false, false, true);
+        let capabilities = session_capability_set(false, false, true, false);
 
         assert_eq!(capabilities, Capability::LOCK);
         for action in [
@@ -1012,7 +1059,58 @@ mod tests {
         // No system manager, no screen saver - a `dbus-run-session` sandbox or
         // a container - so the answer is the empty set rather than a full
         // house nothing can deliver.
-        assert!(session_capability_set(false, false, false).is_empty());
+        assert!(session_capability_set(false, false, false, false).is_empty());
+    }
+
+    #[test]
+    fn a_desktop_session_manager_advertises_logout_without_logind() {
+        // `logout()` falls back to the GNOME/KDE/XFCE managers when the
+        // logind path fails, so a traditional X11 desktop without a logind
+        // seat session still has a working logout, and the bits must say so
+        // instead of greying out a menu entry the desktop can deliver. The
+        // management bit rides along: a session-management backend does
+        // exist. Nothing else has a receiver here.
+        let capabilities = session_capability_set(false, false, false, true);
+
+        assert!(capabilities.contains(Capability::LOGOUT));
+        assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
+        for action in [
+            SessionAction::Lock,
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+        ] {
+            assert!(
+                !capabilities.contains(action.capability()),
+                "{action:?} has no receiver without logind or a screen saver"
+            );
+        }
+    }
+
+    #[test]
+    fn the_receivers_compose_across_buses() {
+        // One host, three disjoint receivers: a logind daemon that cannot
+        // resolve the caller, a reachable screen saver, and a desktop session
+        // manager. Each action's bit follows its own receiver and nothing
+        // else's.
+        let capabilities = session_capability_set(true, false, true, true);
+
+        for action in [
+            SessionAction::Lock,
+            SessionAction::Logout,
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+        ] {
+            assert!(
+                capabilities.contains(action.capability()),
+                "{action:?} has a receiver (manager, screen saver or desktop \
+                 session manager) and must be advertised"
+            );
+        }
+        assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
     }
 
     #[test]

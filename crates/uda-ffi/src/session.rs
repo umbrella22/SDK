@@ -321,22 +321,32 @@ mod tests {
             // APIs, so the full matrix is unconditional there.
             assert_eq!(capabilities, full_set);
         } else if cfg!(target_os = "linux") {
-            // The Linux answer is probed, not hardcoded: a live logind seat
-            // session -> the full set, logind without any session object
-            // (systemd-enabled WSL2) -> the power actions alone, screen saver
-            // alone -> LOCK, neither bus -> empty. Anything else means the
-            // probe and the matrix disagree.
-            let power_actions = Capability::SUSPEND
-                | Capability::HIBERNATE
-                | Capability::REBOOT
-                | Capability::SHUTDOWN;
-            assert!(
-                capabilities == full_set
-                    || capabilities == power_actions
-                    || capabilities == Capability::LOCK
-                    || capabilities.is_empty(),
-                "Linux must answer one of the four probe states, got {capabilities:?}"
+            // The Linux answer is probed, not hardcoded, and its two
+            // session-management bits are two views of one condition: some
+            // receiver can deliver a logout, whether the logind caller-session
+            // path or a reachable desktop session manager. Anything the
+            // documented seven misses would mean the probe and the matrix
+            // disagree; the absence of power bits without a manager is
+            // covered by the documented-set test above.
+            assert_eq!(
+                capabilities.contains(Capability::LOGOUT),
+                capabilities.contains(Capability::SESSION_MANAGEMENT),
+                "LOGOUT and SESSION_MANAGEMENT must agree, got {capabilities:?}"
             );
+            if !capabilities.contains(Capability::LOCK)
+                && !capabilities.contains(Capability::LOGOUT)
+            {
+                assert!(
+                    capabilities.is_empty()
+                        || capabilities
+                            == Capability::SUSPEND
+                                | Capability::HIBERNATE
+                                | Capability::REBOOT
+                                | Capability::SHUTDOWN,
+                    "no lock and no logout receiver must leave only the power \
+                     actions or nothing, got {capabilities:?}"
+                );
+            }
         } else {
             // No backend on an exotic target: "nothing at all".
             assert!(capabilities.is_empty());
