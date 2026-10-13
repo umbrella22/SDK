@@ -50,15 +50,19 @@ impl LinuxWallpaperManager {
         format!("file://{}", encoded)
     }
 
-    /// Decode a GNOME wallpaper value (`'file:///path'`) back into a filesystem
-    /// path, undoing exactly the escaping [`Self::file_uri`] applies.
-    ///
-    /// A value that is not a `file://` URI (an unset or foreign key) yields
-    /// `None` rather than a made-up path.
+    /// Decode gsettings' GVariant string, then its local file URI.
+    /// Foreign schemes, remote hosts and malformed encodings yield no path.
     fn strip_file_uri(value: &str) -> Option<String> {
-        let value = value.trim().trim_matches('\'').trim_matches('"').trim();
-        let path = value.strip_prefix("file://")?;
-        Some(percent_decode(path))
+        let uri = decode_gvariant_string(value)?;
+        let location = uri.strip_prefix("file://")?;
+        let (authority, path) = location.split_once('/')?;
+        if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+            return None;
+        }
+        if path.contains(['?', '#']) {
+            return None;
+        }
+        percent_decode(&format!("/{path}"))
     }
 
     /// Whether GNOME's `color-scheme` key says the dark preference is active.
@@ -129,7 +133,12 @@ impl LinuxWallpaperManager {
                 output.status.code().unwrap_or(-1)
             )));
         }
-        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let text = String::from_utf8(output.stdout)
+            .map_err(|error| {
+                UdaError::DetectionFailed(format!("{program} returned invalid UTF-8: {error}"))
+            })?
+            .trim()
+            .to_string();
         if text.is_empty() {
             Ok(None)
         } else {
@@ -297,10 +306,16 @@ impl LinuxWallpaperManager {
         path: &str,
         options: &WallpaperOptions,
     ) -> Result<(), UdaError> {
+        // The hyprpaper diagnosis is kept: with no second tool to fall back to,
+        // it - not a generic "nothing available" - is the caller's answer.
+        let mut hyprpaper_error = None;
         if Self::command_exists("hyprctl").await {
             match Self::set_wallpaper_hyprpaper(path, options).await {
                 Ok(()) => return Ok(()),
-                Err(e) => log::debug!("hyprpaper via hyprctl failed: {e}"),
+                Err(e) => {
+                    log::debug!("hyprpaper via hyprctl failed: {e}");
+                    hyprpaper_error = Some(e);
+                }
             }
         }
 
@@ -308,9 +323,11 @@ impl LinuxWallpaperManager {
             return Self::set_wallpaper_swww(path, options).await;
         }
 
-        Err(UdaError::NotSupported(
-            "neither hyprpaper (via hyprctl) nor swww is available".to_string(),
-        ))
+        Err(hyprpaper_error.unwrap_or_else(|| {
+            UdaError::NotSupported(
+                "neither hyprpaper (via hyprctl) nor swww is available".to_string(),
+            )
+        }))
     }
 
     /// `hyprctl hyprpaper preload <path>` argument vector.
@@ -333,16 +350,38 @@ impl LinuxWallpaperManager {
         ]
     }
 
+    /// hyprctl can exit successfully even when hyprpaper rejects its IPC request.
+    /// Only the daemon's `ok` reply acknowledges a completed operation.
+    async fn hyprpaper_command(args: Vec<String>) -> Result<(), UdaError> {
+        let output = Self::quiet_command("hyprctl", args, Stdio::piped()).await?;
+        if !output.status.success() {
+            return Err(UdaError::DetectionFailed(format!(
+                "hyprctl hyprpaper exited with status {}",
+                output.status
+            )));
+        }
+        let reply = std::str::from_utf8(&output.stdout).map_err(|error| {
+            UdaError::DetectionFailed(format!("hyprpaper returned invalid UTF-8: {error}"))
+        })?;
+        if reply.trim() == "ok" {
+            return Ok(());
+        }
+        Err(UdaError::DetectionFailed(format!(
+            "hyprpaper rejected the request: {}",
+            reply.trim()
+        )))
+    }
+
     /// Wallpaper through hyprpaper, per `docs/internals/wallpaper_specs.md`:
     /// preload the image first, then point each monitor at it.
     async fn set_wallpaper_hyprpaper(
         path: &str,
         options: &WallpaperOptions,
     ) -> Result<(), UdaError> {
-        Self::run_command("hyprctl", Self::hyprpaper_preload_args(path)).await?;
+        Self::hyprpaper_command(Self::hyprpaper_preload_args(path)).await?;
 
         for monitor in Self::hyprpaper_monitor_tokens(options).await? {
-            Self::run_command("hyprctl", Self::hyprpaper_wallpaper_args(&monitor, path)).await?;
+            Self::hyprpaper_command(Self::hyprpaper_wallpaper_args(&monitor, path)).await?;
         }
 
         Ok(())
@@ -530,7 +569,13 @@ fn desktop_is_hyprland(xdg_current_desktop: Option<&str>) -> bool {
 /// consults `DESKTOP_SESSION`) decides.
 fn gnome_wallpaper_keys(info: &EnvironmentInfo) -> bool {
     match info.xdg_current_desktop.as_deref() {
-        Some(value) => value.to_ascii_lowercase().contains("gnome"),
+        Some(value) => {
+            let value = value.to_ascii_lowercase();
+            value.contains("gnome")
+                || value
+                    .split(':')
+                    .any(|entry| entry.trim().eq_ignore_ascii_case("Unity"))
+        }
         None => matches!(info.desktop_environment, DesktopEnvironment::Gnome),
     }
 }
@@ -559,38 +604,76 @@ fn hex_pair(bytes: &[u8], start: usize) -> Option<u8> {
     u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()
 }
 
-/// Decode the `%XX` escapes [`LinuxWallpaperManager::file_uri`] produces.
-///
-/// Malformed escapes are kept literally: a filename containing a stray `%` must
-/// survive the round trip instead of being truncated or panicking.
-fn percent_decode(input: &str) -> String {
+/// Decode the quoted string syntax printed by gsettings (GLib GVariant).
+fn decode_gvariant_string(value: &str) -> Option<String> {
+    let mut chars = value.trim().chars();
+    let quote = chars.next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let mut decoded = String::new();
+    while let Some(character) = chars.next() {
+        if character == quote {
+            return chars.next().is_none().then_some(decoded);
+        }
+        let character = if character == '\\' {
+            match chars.next()? {
+                'a' => '\u{7}',
+                'b' => '\u{8}',
+                'f' => '\u{c}',
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                'v' => '\u{b}',
+                '\n' => continue,
+                escape @ ('u' | 'U') => {
+                    let digits = if escape == 'u' { 4 } else { 8 };
+                    let mut code = 0;
+                    for _ in 0..digits {
+                        let digit = chars.next()?;
+                        if !digit.is_ascii_hexdigit() {
+                            return None;
+                        }
+                        code = code * 16 + digit.to_digit(16)?;
+                    }
+                    char::from_u32(code)?
+                }
+                // GVariant treats other escaped characters literally, including
+                // quotes and backslashes (unlike JSON's escape grammar).
+                other => other,
+            }
+        } else {
+            character
+        };
+        if character == '\0' {
+            return None;
+        }
+        decoded.push(character);
+    }
+    None
+}
+
+/// Decode a URI path without replacing malformed escapes or invalid UTF-8.
+fn percent_decode(input: &str) -> Option<String> {
     let bytes = input.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut index = 0;
 
     while index < bytes.len() {
-        // `%` is kept with its digits when the escape is malformed.
-        let escaped = if bytes[index] == b'%' {
-            hex_pair(bytes, index + 1)
+        if bytes[index] == b'%' {
+            decoded.push(hex_pair(bytes, index + 1)?);
+            index += 3;
         } else {
-            None
-        };
-        match escaped {
-            Some(byte) => {
-                decoded.push(byte);
-                index += 3;
-            }
-            None => {
-                decoded.push(bytes[index]);
-                index += 1;
-            }
+            decoded.push(bytes[index]);
+            index += 1;
         }
     }
 
-    match String::from_utf8(decoded) {
-        Ok(text) => text,
-        Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+    let path = String::from_utf8(decoded).ok()?;
+    if path.contains('\0') {
+        return None;
     }
+    Some(path)
 }
 
 impl WallpaperManager for LinuxWallpaperManager {
@@ -831,10 +914,72 @@ mod tests {
     }
 
     #[test]
-    fn a_stray_percent_survives_decoding() {
-        assert_eq!(percent_decode("100%file"), "100%file");
-        assert_eq!(percent_decode("%2"), "%2");
-        assert_eq!(percent_decode("a%zzb"), "a%zzb");
+    fn gsettings_preserves_escaped_and_awkward_valid_paths() {
+        for (value, expected) in [
+            (r#"'file:///tmp/it\'s\\wall.jpg'"#, "/tmp/it's\\wall.jpg"),
+            (r#""file:///tmp/a\"b.jpg""#, "/tmp/a\"b.jpg"),
+            (r#"'file:///tmp/\u4e2d\U0001f680.jpg'"#, "/tmp/中🚀.jpg"),
+            (r#"'file:///tmp/line\n tab\t.jpg'"#, "/tmp/line\n tab\t.jpg"),
+            (
+                "'file:///tmp/中文%20a%25b%23c%3Fd%2520.jpg'",
+                "/tmp/中文 a%b#c?d%20.jpg",
+            ),
+            ("'file://localhost/tmp/wall.jpg'", "/tmp/wall.jpg"),
+            ("'file://LOCALHOST/tmp/wall.jpg'", "/tmp/wall.jpg"),
+            ("'file:///tmp/  wall  '", "/tmp/  wall  "),
+            ("'file:///tmp/a%27%22%5Cb.jpg'", "/tmp/a'\"\\b.jpg"),
+            ("'file:////tmp/wall.jpg'", "//tmp/wall.jpg"),
+        ] {
+            assert_eq!(
+                LinuxWallpaperManager::strip_file_uri(value).as_deref(),
+                Some(expected),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn gsettings_rejects_remote_and_malformed_path_representations() {
+        for value in [
+            "'file://remote/tmp/wall.jpg'",
+            "'file://user@localhost/tmp/wall.jpg'",
+            "'file://localhost:80/tmp/wall.jpg'",
+            "'file://relative.jpg'",
+            "'file:///tmp/a%b.jpg'",
+            "'file:///tmp/a%2'",
+            "'file:///tmp/a%zz'",
+            "'file:///tmp/%FF.jpg'",
+            "'file:///tmp/%C0%AF.jpg'",
+            "'file:///tmp/%00.jpg'",
+            "'file:///tmp/a?query'",
+            "'file:///tmp/a#fragment'",
+            r#"'file:///tmp/\u0000.jpg'"#,
+            r#"'file:///tmp/\uD800.jpg'"#,
+            r#"'file:///tmp/\U00110000.jpg'"#,
+            r#"'file:///tmp/\u123.jpg'"#,
+            r#"'file:///tmp/\uZZZZ.jpg'"#,
+            "file:///tmp/unquoted.jpg",
+            "'file:///tmp/unterminated.jpg",
+            "'file:///tmp/a.jpg' trailing",
+            "'file:///tmp/a'b.jpg'",
+        ] {
+            assert_eq!(
+                LinuxWallpaperManager::strip_file_uri(value),
+                None,
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn gvariant_string_decoder_follows_glib_escaping() {
+        assert_eq!(
+            decode_gvariant_string(r#"'\a\b\f\n\r\t\v'"#),
+            Some("\u{7}\u{8}\u{c}\n\r\t\u{b}".to_string())
+        );
+        assert_eq!(decode_gvariant_string("'a\\\nb'"), Some("ab".to_string()));
+        assert_eq!(decode_gvariant_string(r#"'a\qb'"#), Some("aqb".to_string()));
+        assert_eq!(decode_gvariant_string("'trailing\\"), None);
     }
 
     #[test]

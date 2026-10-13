@@ -423,14 +423,17 @@ int32_t uda_media_send_command(int32_t command);
  * A set bit means a receiver for the action was reachable when the
  * capabilities were queried; the attempt can still fail (hibernation switched
  * off, polkit refusal) and then fails with UDA_ERR_NOT_SUPPORTED. On Linux
- * the session-management bits additionally require the *calling* session to
- * be resolvable: lock-session and logout speak to the caller's own logind
- * session object, so a daemon that runs sessionless (or can only see other
- * users' sessions, as on a systemd-enabled WSL2 host) answers with the power
- * bits alone - unless a desktop session manager (GNOME/KDE/XFCE) is reachable
- * on the session bus, which claims the logout pair on its own, as on a
- * traditional X11 desktop. Windows reboot and shutdown can likewise fail at
- * attempt time when the caller lacks the SeShutdownPrivilege.
+ * LOCK needs the ScreenSaver service or a resolvable logind `auto` session
+ * (the caller's session, with the user's display session as the fallback
+ * logind itself applies), while LOGOUT and SESSION_MANAGEMENT need the
+ * caller's *own* logind session - resolved with GetSession(""), which never
+ * falls back to a display session - or a GNOME/KDE/XFCE desktop logout
+ * manager whose bus name is owned or activatable. A daemon that runs
+ * sessionless (or can only see other users' sessions, as on a systemd-enabled
+ * WSL2 host) therefore answers with the power bits, plus LOCK when `auto`
+ * resolves. Discovery never activates a desktop manager; activation or policy
+ * can still refuse an attempted action. Windows reboot and shutdown can
+ * likewise fail at attempt time when the caller lacks the SeShutdownPrivilege.
  *
  * @param out_capabilities  Receives the bitmask. Must not be null.
  * @return UDA_OK on success, otherwise a negative status code.
@@ -569,8 +572,12 @@ const char *uda_status_message(int32_t status);
  *   - A menu handle stays valid after uda_tray_set_menu(): the icon holds its
  *     own reference, so the menu keeps working whether or not the handle is
  *     destroyed later. Destroying the menu handle (uda_tray_menu_destroy())
- *     detaches the menu from every icon still showing it, so its callbacks
- *     stop firing immediately; the icons themselves stay alive.
+ *     detaches the menu from every icon still showing it and closes its
+ *     callback gate, so even a row snapshot a backend already cloned stays
+ *     silent; a destroy that lands while one of the menu's callbacks is still
+ *     running reports UDA_ERR_INTERNAL and leaves the menu intact - free the
+ *     host trampolines only after the destroy reports success. The icons
+ *     themselves stay alive.
  *
  * CALLBACK THREADING MODEL (read before writing a handler)
  *
@@ -789,14 +796,21 @@ int32_t uda_tray_set_menu(uint64_t tray_handle, uint64_t menu_handle);
  * Destroy a menu handle.
  *
  * The menu is detached from EVERY tray icon that still shows it, so its rows
- * and callbacks stop firing immediately; the icons themselves stay alive and
+ * and callbacks stop firing (a row snapshot a backend already cloned stays
+ * silent instead of calling the host); the icons themselves stay alive and
  * simply have no menu afterwards. This makes destroying a menu handle safe even
- * when the host has already attached it and torn down its callback trampolines.
- * Terminal: the handle cannot be reused afterwards.
+ * when the host has already attached it. Terminal: the handle cannot be reused
+ * afterwards.
+ *
+ * While one of the menu's callbacks is still running, the destroy fails with
+ * UDA_ERR_INTERNAL and the menu stays fully intact: a host waits for its own
+ * callback to return and retries. Callback trampolines may be freed only after
+ * this call reports success.
  *
  * @param menu_handle  A handle from uda_tray_menu_create().
  * @return UDA_OK on success, UDA_ERR_INVALID_ARGUMENT when the handle is not a
- *         live menu in this process.
+ *         live menu in this process, UDA_ERR_INTERNAL while a callback of this
+ *         menu is still in flight (retry after it returned).
  */
 int32_t uda_tray_menu_destroy(uint64_t menu_handle);
 

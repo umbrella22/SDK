@@ -42,15 +42,12 @@
 //! # Capabilities are probed, not assumed
 //!
 //! [`LinuxSessionManager::capabilities`] asks the buses which receivers are
-//! actually there before advertising anything: the full set when logind
-//! answers on the system bus *and* can resolve the calling session (the
-//! `session/auto` object `loginctl lock-session` speaks to), the power
-//! actions alone when the daemon runs without a caller-attributable session
-//! (the systemd-enabled WSL2 shape), the logout pair when only a desktop
-//! session manager is reachable (a traditional X11 desktop), `LOCK` alone
-//! when only the session bus's ScreenSaver answers, and nothing when neither
-//! bus answers (a `dbus-run-session` sandbox). The probe runs once per
-//! process and is cached, the same trade the wake-lock backend makes.
+//! actually there before advertising anything. Power bits follow the logind
+//! manager. `LOCK` follows ScreenSaver or a resolvable `auto` session (which
+//! may be the user's display session). `LOGOUT` and `SESSION_MANAGEMENT`
+//! require the caller's own session or an owned/activatable desktop logout
+//! manager. `TerminateSession("")` never targets the display-session fallback.
+//! The bounded probe runs once per process and is cached.
 //!
 //! Whatever the probe said, an action that is attempted and then not delivered
 //! (logind refusing or timing out, `loginctl` exiting nonzero) reports
@@ -73,7 +70,7 @@ use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
-use crate::wakelock::{bus_unique_names, logind_present, screensaver_present};
+use crate::wakelock::{logind_present, screensaver_present};
 use crate::{COMMAND_TIMEOUT, DBUS_TIMEOUT};
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
@@ -528,121 +525,140 @@ fn not_delivered(detail: impl std::fmt::Display) -> UdaError {
     UdaError::NotSupported(detail.to_string())
 }
 
-/// Which session receivers are reachable, probed once per process.
-///
-/// Returns `(logind, logind_session, screen_saver, desktop_logout)`, cached
-/// in a process-wide [`OnceLock`]: receivers are not installed mid-session,
-/// while `capabilities()` sits on the hot path (the core `perform` guard
-/// consults it before *every* action), so one bounded probe round per process
-/// beats bus round trips per query. A receiver that appears later is only
-/// noticed after a restart, which errs in the honest direction: something
-/// unadvertised stays unavailable, never the reverse. A probe failure caches
-/// as "absent"; see [`probe_reachable`].
-fn session_reachability() -> (bool, bool, bool, bool) {
-    static REACHABLE: OnceLock<(bool, bool, bool, bool)> = OnceLock::new();
+/// Independent receivers for each class of session action.
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionReachability {
+    logind: bool,
+    lock_auto: bool,
+    logout_self: bool,
+    screen_saver: bool,
+    desktop_logout: bool,
+}
+
+/// Probe once per process; failures leave only the affected receiver absent.
+fn session_reachability() -> SessionReachability {
+    static REACHABLE: OnceLock<SessionReachability> = OnceLock::new();
     *REACHABLE.get_or_init(|| {
         let logind = probe_reachable(crate::sync::run_async(logind_present()), "logind");
-        let logind_session = if logind {
-            // Only worth asking while the manager owns the name; without it
-            // the session probe cannot succeed, so skip the round trip.
-            probe_reachable(
-                crate::sync::run_async(logind_session_present()),
-                "logind sessions",
-            )
+        let (lock_auto, logout_self) = if logind {
+            match crate::sync::run_async(logind_sessions_present()) {
+                Ok(Ok(sessions)) => sessions,
+                Ok(Err(error)) | Err(error) => {
+                    log::debug!("logind session probes did not answer: {error}");
+                    (false, false)
+                }
+            }
         } else {
-            false
+            (false, false)
         };
-        let desktop_logout = if logind_session {
-            // `LOGOUT` is already claimed by the caller-session path; skip
-            // the session-bus round trip for the desktop managers.
-            false
-        } else {
-            probe_reachable(
+        let desktop_logout = !logout_self
+            && probe_reachable(
                 crate::sync::run_async(desktop_logout_manager_present()),
                 "desktop logout managers",
-            )
-        };
+            );
         let screen_saver = probe_reachable(
             crate::sync::run_async(screensaver_present()),
             "screen saver",
         );
-        (logind, logind_session, screen_saver, desktop_logout)
+        SessionReachability {
+            logind,
+            lock_auto,
+            logout_self,
+            screen_saver,
+            desktop_logout,
+        }
     })
 }
 
-/// Does logind have a session the *caller* can act on?
-///
-/// Owning `org.freedesktop.login1` on the system bus only proves the daemon
-/// runs, and a non-empty `ListSessions` only proves session objects exist
-/// somewhere on the machine: systemd-enabled WSL2 keeps a PTY/SSH session in
-/// the list while `loginctl lock-session` still fails, because both it and
-/// `TerminateSession("")` resolve the **calling** session - the special
-/// `session/auto` object, which logind only materialises when the caller can
-/// be attributed to a session. So the probe lists first (management is
-/// meaningless with no session anywhere), then asks the manager to resolve
-/// `auto`, the exact object the actions target. Any resolution error means
-/// the caller has no session, which is a `false` verdict rather than a probe
-/// failure; everything upstream (bus, timeouts) still folds to "absent" via
-/// [`probe_reachable`]. Bounded by [`DBUS_TIMEOUT`] throughout.
-async fn logind_session_present() -> Result<bool, UdaError> {
+/// `auto` can use the user's display session; `""` requires the caller's own.
+/// Both probes share a connection and listing, but fail independently.
+async fn logind_sessions_present() -> Result<(bool, bool), UdaError> {
     let connection = LinuxSessionManager::system_connection().await?;
-    let proxy = zbus::Proxy::new(&connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE)
-        .await
-        .map_err(|e| not_delivered(format!("the logind manager proxy: {e}")))?;
+    logind_sessions_on(&connection).await
+}
+
+async fn logind_sessions_on(connection: &Connection) -> Result<(bool, bool), UdaError> {
+    let proxy = tokio::time::timeout(
+        DBUS_TIMEOUT,
+        zbus::Proxy::new(connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE),
+    )
+    .await
+    .map_err(|_| not_delivered("building the logind session proxy timed out".to_string()))?
+    .map_err(|error| not_delivered(format!("the logind manager proxy: {error}")))?;
     let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
         match tokio::time::timeout(DBUS_TIMEOUT, proxy.call("ListSessions", &())).await {
             Ok(Ok(sessions)) => sessions,
-            Ok(Err(e)) => return Err(not_delivered(format!("ListSessions failed: {e}"))),
-            Err(_) => {
-                return Err(not_delivered(format!(
-                    "ListSessions timed out after {:?}",
-                    DBUS_TIMEOUT
-                )))
-            }
+            Ok(Err(error)) => return Err(not_delivered(format!("ListSessions failed: {error}"))),
+            Err(_) => return Err(not_delivered("ListSessions timed out".to_string())),
         };
     if sessions.is_empty() {
-        return Ok(false);
+        return Ok((false, false));
     }
-    // `GetSession("auto")` is the object-level check: it resolves the calling
-    // session or answers NoSuchSession. A resolution failure is the probe's
-    // honest "no session for this caller" answer, not an error.
+    let lock_auto = logind_session_resolves(&proxy, "auto").await;
+    let logout_self = logind_session_resolves(&proxy, "").await;
+    Ok((lock_auto, logout_self))
+}
+
+async fn logind_session_resolves(proxy: &zbus::Proxy<'_>, id: &str) -> bool {
     match tokio::time::timeout(
         DBUS_TIMEOUT,
-        proxy.call::<_, (&str,), zbus::zvariant::OwnedObjectPath>("GetSession", &("auto",)),
+        proxy.call::<_, (&str,), zbus::zvariant::OwnedObjectPath>("GetSession", &(id,)),
     )
     .await
     {
-        Ok(Ok(_)) => Ok(true),
+        Ok(Ok(_)) => true,
         Ok(Err(error)) => {
-            log::debug!("logind cannot resolve the calling session (auto): {error}");
-            Ok(false)
+            log::debug!("logind cannot resolve session {id:?}: {error}");
+            false
         }
-        Err(_) => Err(not_delivered(format!(
-            "GetSession timed out after {:?}",
-            DBUS_TIMEOUT
-        ))),
+        Err(_) => {
+            log::debug!("GetSession({id:?}) timed out after {DBUS_TIMEOUT:?}");
+            false
+        }
     }
 }
 
-/// Is a desktop session manager with a logout entry point on the session bus?
-///
-/// `logout()` falls back to the desktop's own session manager whenever the
-/// logind path fails, so those managers make `LOGOUT` claimable even where
-/// logind cannot resolve a caller session: a traditional X11 desktop that
-/// predates seat attribution has exactly such a manager and no logind
-/// session. The probe re-dials the same well-known services the fallback
-/// dials; only name ownership is checked, since a wire-level refusal stays
-/// attempt-time territory (polkit, desktop policy). One
-/// [`bus_unique_names`] listing covers all three candidates - the fallback
-/// tries them one by one, but name ownership does not need a round trip
-/// apiece. Bounded by [`DBUS_TIMEOUT`] and folding to "absent" like every
-/// other probe.
+/// Owned or activatable desktop logout managers are potential receivers.
+/// Listing names never activates a service or calls its logout method.
 async fn desktop_logout_manager_present() -> Result<bool, UdaError> {
     let connection = LinuxSessionManager::session_connection().await?;
-    let names = bus_unique_names(&connection, "building the session bus daemon proxy").await?;
-    Ok(LOGOUT_CANDIDATES
-        .iter()
-        .any(|candidate| names.iter().any(|name| name.as_str() == candidate.service)))
+    desktop_logout_manager_on(&connection).await
+}
+
+async fn desktop_logout_manager_on(connection: &Connection) -> Result<bool, UdaError> {
+    let proxy = crate::internal_dbus(
+        "building the desktop logout bus proxy",
+        zbus::fdo::DBusProxy::new(connection),
+    )
+    .await?;
+    let owned = desktop_bus_names(&proxy, "ListNames").await;
+    let activatable = desktop_bus_names(&proxy, "ListActivatableNames").await;
+    Ok(LOGOUT_CANDIDATES.iter().any(|candidate| {
+        owned
+            .iter()
+            .chain(&activatable)
+            .any(|name| name == candidate.service)
+    }))
+}
+
+/// A failed listing cannot erase names proven by the other listing.
+async fn desktop_bus_names(proxy: &zbus::fdo::DBusProxy<'_>, method: &str) -> Vec<String> {
+    match tokio::time::timeout(
+        DBUS_TIMEOUT,
+        proxy.inner().call::<_, (), Vec<String>>(method, &()),
+    )
+    .await
+    {
+        Ok(Ok(names)) => names,
+        Ok(Err(error)) => {
+            log::debug!("{method} failed while probing desktop logout managers: {error}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::debug!("{method} timed out while probing desktop logout managers");
+            Vec::new()
+        }
+    }
 }
 
 /// Collapse a bridged probe into a plain bool.
@@ -662,42 +678,19 @@ fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &s
     }
 }
 
-/// Turn probe answers into the honest capability set.
-///
-/// Pure so the whole matrix is testable without a bus. The bits compose
-/// independently, mirroring which receiver each action actually speaks to:
-/// the power actions go straight to the manager, so any reachable logind
-/// claims them; the session-management actions resolve the **calling**
-/// session (`TerminateSession("")`, the `session/auto` object behind
-/// `loginctl lock-session`), so they need either the caller-session probe or
-/// a desktop session manager - `logout()` itself falls back to the GNOME/KDE/
-/// XFCE managers when logind cannot deliver, and a traditional X11 desktop
-/// that predates seat attribution has exactly that manager and no caller
-/// session; and `LOCK` has two receivers, the screen saver on the session bus
-/// and the caller-session logind path, so either one claims it. With no
-/// receiver answering (a `dbus-run-session` sandbox), nothing is claimed.
-fn session_capability_set(
-    logind: bool,
-    logind_session: bool,
-    screen_saver: bool,
-    desktop_logout: bool,
-) -> Capability {
+/// Each capability follows the receiver targeted by its execution path.
+fn session_capability_set(receivers: SessionReachability) -> Capability {
     let mut capabilities = Capability::empty();
-
-    if logind {
+    if receivers.logind {
         capabilities |=
             Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
     }
-    // The two session-management bits are two views of one condition: some
-    // receiver can deliver a logout, whether the logind caller-session path
-    // or a desktop session manager.
-    if logind_session || desktop_logout {
+    if receivers.logout_self || receivers.desktop_logout {
         capabilities |= Capability::SESSION_MANAGEMENT | Capability::LOGOUT;
     }
-    if logind_session || screen_saver {
+    if receivers.lock_auto || receivers.screen_saver {
         capabilities |= Capability::LOCK;
     }
-
     capabilities
 }
 
@@ -742,8 +735,7 @@ impl SessionManager for LinuxSessionManager {
         // WSL2) answers with the power actions alone. Whether logind
         // *authorises* the caller remains a runtime question for the methods
         // above, not a capability question.
-        let (logind, logind_session, screen_saver, desktop_logout) = session_reachability();
-        session_capability_set(logind, logind_session, screen_saver, desktop_logout)
+        session_capability_set(session_reachability())
     }
 }
 
@@ -959,12 +951,292 @@ mod tests {
     }
 
     #[test]
+    fn independent_receiver_matrix_preserves_each_action_boundary() {
+        let power =
+            Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
+        for logind in [false, true] {
+            for lock_auto in [false, true] {
+                for logout_self in [false, true] {
+                    for screen_saver in [false, true] {
+                        for desktop_logout in [false, true] {
+                            let caps = session_capability_set(SessionReachability {
+                                logind,
+                                lock_auto,
+                                logout_self,
+                                screen_saver,
+                                desktop_logout,
+                            });
+                            assert_eq!(caps.intersects(power), logind);
+                            assert_eq!(caps.contains(power), logind);
+                            assert_eq!(caps.contains(Capability::LOCK), lock_auto || screen_saver);
+                            assert_eq!(
+                                caps.contains(Capability::LOGOUT),
+                                logout_self || desktop_logout
+                            );
+                            assert_eq!(
+                                caps.contains(Capability::SESSION_MANAGEMENT),
+                                logout_self || desktop_logout
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn display_session_alone_does_not_pass_the_core_logout_guard() {
+        struct RecordingManager {
+            capabilities: Capability,
+            logout_called: std::cell::Cell<bool>,
+        }
+        impl SessionManager for RecordingManager {
+            fn capabilities(&self) -> Capability {
+                self.capabilities
+            }
+            fn logout(&self) -> Result<(), UdaError> {
+                self.logout_called.set(true);
+                Ok(())
+            }
+            fn lock(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn suspend(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn hibernate(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn reboot(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn shutdown(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+        }
+        let manager = RecordingManager {
+            capabilities: session_capability_set(SessionReachability {
+                logind: true,
+                lock_auto: true,
+                ..SessionReachability::default()
+            }),
+            logout_called: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            uda_core::session::perform(&manager, SessionAction::Logout),
+            Err(UdaError::NotSupported(_))
+        ));
+        assert!(!manager.logout_called.get());
+        assert!(uda_core::session::perform(&manager, SessionAction::Lock).is_ok());
+    }
+
+    /// Each fixture starts its own bus and uses explicit addresses. It cannot
+    /// reach the host's system/session bus or leak global environment changes.
+    struct IsolatedBus {
+        child: std::process::Child,
+        directory: std::path::PathBuf,
+        address: String,
+    }
+
+    impl IsolatedBus {
+        fn start(kde_activatable: bool) -> Self {
+            use std::io::BufRead as _;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "uda-session-mock-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).expect("create isolated bus fixture");
+            if kde_activatable {
+                std::fs::write(
+                    directory.join("org.kde.Shutdown.service"),
+                    format!(
+                        "[D-BUS Service]\nName=org.kde.Shutdown\nExec=/usr/bin/touch {}\n",
+                        directory.join("activated").display()
+                    ),
+                )
+                .expect("write activation fixture");
+            }
+            let config = directory.join("bus.conf");
+            std::fs::write(&config, format!(
+                "<busconfig><type>session</type><listen>unix:tmpdir={}</listen><auth>EXTERNAL</auth><servicedir>{}</servicedir><policy context=\"default\"><allow send_destination=\"*\"/><allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>",
+                directory.display(), directory.display()))
+                .expect("write isolated bus configuration");
+            let mut child = std::process::Command::new("dbus-daemon")
+                .arg("--nofork")
+                .arg("--print-address=1")
+                .arg(format!("--config-file={}", config.display()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon is required for isolated session mocks");
+            let stdout = child.stdout.take().expect("daemon address pipe");
+            let mut address = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut address)
+                .expect("read bus address");
+            let fixture = Self {
+                child,
+                directory,
+                address: address.trim().to_string(),
+            };
+            assert!(
+                !fixture.address.is_empty(),
+                "isolated daemon did not publish an address"
+            );
+            fixture
+        }
+
+        async fn connect(&self) -> Connection {
+            zbus::connection::Builder::address(self.address.as_str())
+                .expect("isolated bus address")
+                .build()
+                .await
+                .expect("connect to isolated bus")
+        }
+    }
+
+    impl Drop for IsolatedBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    type MockSessions = Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)>;
+
+    struct MockLogin1 {
+        auto: bool,
+        caller_self: bool,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.login1.Manager")]
+    impl MockLogin1 {
+        fn list_sessions(&self) -> MockSessions {
+            vec![(
+                "display".to_string(),
+                1000,
+                "mock".to_string(),
+                "seat0".to_string(),
+                zbus::zvariant::OwnedObjectPath::try_from(
+                    "/org/freedesktop/login1/session/display",
+                )
+                .expect("valid mock path"),
+            )]
+        }
+
+        fn get_session(&self, id: &str) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
+            self.calls
+                .lock()
+                .expect("mock calls lock")
+                .push(id.to_string());
+            let resolves = match id {
+                "auto" => self.auto,
+                "" => self.caller_self,
+                _ => false,
+            };
+            if resolves {
+                Ok(zbus::zvariant::OwnedObjectPath::try_from(
+                    "/org/freedesktop/login1/session/display",
+                )
+                .expect("valid mock path"))
+            } else {
+                Err(zbus::fdo::Error::Failed(
+                    "no session for requested selector".to_string(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_logind_probes_use_auto_and_empty_id_independently() {
+        for (auto, caller_self) in [(true, false), (false, true), (true, true), (false, false)] {
+            let fixture = IsolatedBus::start(false);
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _server = zbus::connection::Builder::address(fixture.address.as_str())
+                .expect("mock bus address")
+                .name(LOGIN1_SERVICE)
+                .expect("mock service name")
+                .serve_at(
+                    LOGIN1_PATH,
+                    MockLogin1 {
+                        auto,
+                        caller_self,
+                        calls: calls.clone(),
+                    },
+                )
+                .expect("mock logind interface")
+                .build()
+                .await
+                .expect("start mock logind");
+            let client = fixture.connect().await;
+            assert_eq!(
+                logind_sessions_on(&client).await.expect("session probes"),
+                (auto, caller_self)
+            );
+            assert_eq!(*calls.lock().expect("mock calls lock"), vec!["auto", ""]);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_desktop_probe_finds_owned_and_activatable_names_without_activation() {
+        let fixture = IsolatedBus::start(true);
+        let client = fixture.connect().await;
+        let bus = zbus::fdo::DBusProxy::new(&client)
+            .await
+            .expect("mock daemon proxy");
+        assert!(!bus
+            .name_has_owner("org.kde.Shutdown".try_into().expect("KDE name"))
+            .await
+            .expect("check KDE ownership"));
+        assert!(desktop_logout_manager_on(&client)
+            .await
+            .expect("probe activatable KDE"));
+        assert!(!bus
+            .name_has_owner("org.kde.Shutdown".try_into().expect("KDE name"))
+            .await
+            .expect("discovery must not activate KDE"));
+        assert!(!fixture.directory.join("activated").exists());
+
+        let empty = IsolatedBus::start(false);
+        let client = empty.connect().await;
+        let owner = empty.connect().await;
+        assert!(!desktop_logout_manager_on(&client)
+            .await
+            .expect("empty desktop bus"));
+        owner
+            .request_name("org.kde.Shutdown.Other")
+            .await
+            .expect("unrelated service name");
+        assert!(!desktop_logout_manager_on(&client)
+            .await
+            .expect("exact name matching"));
+        owner
+            .request_name("org.kde.Shutdown")
+            .await
+            .expect("owned KDE name");
+        assert!(desktop_logout_manager_on(&client)
+            .await
+            .expect("owned KDE receiver"));
+    }
+
+    #[test]
     fn a_live_logind_session_advertises_the_full_set() {
         // Logind receives every power action, and with a live seat session
         // the session objects receive the session-management ones, so both
         // quadrants with a live session claim all seven bits.
         for screen_saver in [true, false] {
-            let capabilities = session_capability_set(true, true, screen_saver, false);
+            let capabilities = session_capability_set(SessionReachability {
+                logind: true,
+                lock_auto: true,
+                logout_self: true,
+                screen_saver,
+                desktop_logout: false,
+            });
 
             assert!(
                 capabilities.contains(Capability::SESSION_MANAGEMENT),
@@ -995,7 +1267,13 @@ mod tests {
         // `loginctl lock-session` nor `TerminateSession("")` can resolve the
         // calling session, so the session bits stay unadvertised. The
         // manager-level power actions keep their receiver.
-        let capabilities = session_capability_set(true, false, false, false);
+        let capabilities = session_capability_set(SessionReachability {
+            logind: true,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: false,
+            desktop_logout: false,
+        });
 
         for action in [
             SessionAction::Suspend,
@@ -1025,7 +1303,13 @@ mod tests {
         // The bits compose: `lock()` tries the screen saver before any
         // `loginctl` call, so a reachable screen saver claims LOCK even when
         // logind has no session for the caller.
-        let capabilities = session_capability_set(true, false, true, false);
+        let capabilities = session_capability_set(SessionReachability {
+            logind: true,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: true,
+            desktop_logout: false,
+        });
 
         for action in [
             SessionAction::Suspend,
@@ -1047,10 +1331,15 @@ mod tests {
     #[test]
     fn a_screen_saver_without_logind_advertises_lock_alone() {
         // Without logind the power actions have no receiver at all and the
-        // loginctl CLI tier is gone with it; the desktop logout managers are
-        // tried opportunistically, never probed. Only the screen-saver lock is
+        // loginctl CLI tier is gone with it; no desktop logout manager was found. Only the screen-saver lock is
         // honestly claimable.
-        let capabilities = session_capability_set(false, false, true, false);
+        let capabilities = session_capability_set(SessionReachability {
+            logind: false,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: true,
+            desktop_logout: false,
+        });
 
         assert_eq!(capabilities, Capability::LOCK);
         for action in [
@@ -1072,7 +1361,14 @@ mod tests {
         // No system manager, no screen saver - a `dbus-run-session` sandbox or
         // a container - so the answer is the empty set rather than a full
         // house nothing can deliver.
-        assert!(session_capability_set(false, false, false, false).is_empty());
+        assert!(session_capability_set(SessionReachability {
+            logind: false,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: false,
+            desktop_logout: false
+        })
+        .is_empty());
     }
 
     #[test]
@@ -1083,7 +1379,13 @@ mod tests {
         // instead of greying out a menu entry the desktop can deliver. The
         // management bit rides along: a session-management backend does
         // exist. Nothing else has a receiver here.
-        let capabilities = session_capability_set(false, false, false, true);
+        let capabilities = session_capability_set(SessionReachability {
+            logind: false,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: false,
+            desktop_logout: true,
+        });
 
         assert!(capabilities.contains(Capability::LOGOUT));
         assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
@@ -1107,7 +1409,13 @@ mod tests {
         // resolve the caller, a reachable screen saver, and a desktop session
         // manager. Each action's bit follows its own receiver and nothing
         // else's.
-        let capabilities = session_capability_set(true, false, true, true);
+        let capabilities = session_capability_set(SessionReachability {
+            logind: true,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: true,
+            desktop_logout: true,
+        });
 
         for action in [
             SessionAction::Lock,

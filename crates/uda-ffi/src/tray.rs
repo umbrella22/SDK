@@ -15,10 +15,15 @@
 //!   unregisters the icon from the shell.
 //! * **Menus** are shared records. `uda_tray_set_menu` clones the `Arc` into the
 //!   icon, so a menu handle outliving its tray icon is valid. Destroying the
-//!   menu handle detaches it from every icon still showing it, which is what
-//!   keeps the rows' callbacks - they capture raw host function pointers - from
-//!   firing after the host has torn its trampolines down. Both entries must
-//!   eventually be destroyed, or the process exits and releases everything.
+//!   menu handle first closes the menu's callback gate and then detaches it
+//!   from every icon still showing it. The gate is what makes the detach safe
+//!   for the rows' callbacks - they capture raw host function pointers - even
+//!   though backends hold their own snapshots: every trampoline consults the
+//!   gate before calling the host, so a stale snapshot after a successful
+//!   destroy is a silent no-op, and a callback that is still running makes the
+//!   destroy fail with a typed "retry" error instead of releasing a host
+//!   pointer that is still reachable. Both entries must eventually be
+//!   destroyed, or the process exits and releases everything.
 //!
 //! # Callback threading model
 //!
@@ -199,7 +204,60 @@ enum TrayEntry {
     /// A registered tray icon.
     Icon(Arc<TrayIcon>),
     /// A context menu, attached to zero or more icons.
-    Menu(Arc<TrayMenu>),
+    Menu {
+        menu: Arc<TrayMenu>,
+        callbacks: Arc<MenuCallbacks>,
+    },
+}
+
+#[derive(Default)]
+struct CallbackState {
+    closed: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+struct MenuCallbacks(Mutex<CallbackState>);
+
+impl MenuCallbacks {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CallbackState> {
+        match self.0.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    fn enter(&self) -> Option<ActiveCallback<'_>> {
+        let mut state = self.lock();
+        if state.closed {
+            return None;
+        }
+        state.active += 1;
+        Some(ActiveCallback(self))
+    }
+
+    fn close(&self) -> Result<(), Failure> {
+        let mut state = self.lock();
+        // A host callback can be waiting for the thread calling destroy (for
+        // example, a koffi trampoline queued on the JavaScript event loop).
+        // Waiting here would deadlock, including when a callback destroys itself.
+        if state.active != 0 {
+            return Err(Failure::Uda(UdaError::Internal(
+                "a menu callback is in progress; retain its callbacks and retry destruction after it returns"
+                    .to_string(),
+            )));
+        }
+        state.closed = true;
+        Ok(())
+    }
+}
+
+struct ActiveCallback<'a>(&'a MenuCallbacks);
+
+impl Drop for ActiveCallback<'_> {
+    fn drop(&mut self) {
+        self.0.lock().active -= 1;
+    }
 }
 
 /// The diagnosis for a handle this process never issued as a tray icon.
@@ -288,16 +346,18 @@ impl TrayRegistry {
         let entries = self.lock();
         match entries.get(&handle) {
             Some(TrayEntry::Icon(icon)) => Ok(Arc::clone(icon)),
-            Some(TrayEntry::Menu(_)) => Err(wrong_kind(handle, "menu", "tray icon")),
+            Some(TrayEntry::Menu { .. }) => Err(wrong_kind(handle, "menu", "tray icon")),
             None => Err(unknown_icon(handle)),
         }
     }
 
-    /// Borrow the menu behind `handle`.
-    fn menu(&self, handle: u64) -> Result<Arc<TrayMenu>, Failure> {
+    /// Borrow the menu behind `handle`, together with its callback gate.
+    fn menu(&self, handle: u64) -> Result<(Arc<TrayMenu>, Arc<MenuCallbacks>), Failure> {
         let entries = self.lock();
         match entries.get(&handle) {
-            Some(TrayEntry::Menu(menu)) => Ok(Arc::clone(menu)),
+            Some(TrayEntry::Menu { menu, callbacks }) => {
+                Ok((Arc::clone(menu), Arc::clone(callbacks)))
+            }
             Some(TrayEntry::Icon(_)) => Err(wrong_kind(handle, "tray icon", "menu")),
             None => Err(unknown_menu(handle)),
         }
@@ -323,11 +383,13 @@ impl TrayRegistry {
         let entries = self.lock();
         let icon = match entries.get(&tray_handle) {
             Some(TrayEntry::Icon(icon)) => Arc::clone(icon),
-            Some(TrayEntry::Menu(_)) => return Err(wrong_kind(tray_handle, "menu", "tray icon")),
+            Some(TrayEntry::Menu { .. }) => {
+                return Err(wrong_kind(tray_handle, "menu", "tray icon"))
+            }
             None => return Err(unknown_icon(tray_handle)),
         };
         let menu = match entries.get(&menu_handle) {
-            Some(TrayEntry::Menu(menu)) => Arc::clone(menu),
+            Some(TrayEntry::Menu { menu, .. }) => Arc::clone(menu),
             Some(TrayEntry::Icon(_)) => return Err(wrong_kind(menu_handle, "tray icon", "menu")),
             None => return Err(unknown_menu(menu_handle)),
         };
@@ -350,7 +412,7 @@ impl TrayRegistry {
             Some(TrayEntry::Icon(icon)) => Ok(icon),
             // Put it back under the same lock: the caller addressed a menu with
             // an icon call, so the record must not be lost to a typo.
-            Some(entry @ TrayEntry::Menu(_)) => {
+            Some(entry @ TrayEntry::Menu { .. }) => {
                 entries.insert(handle, entry);
                 Err(wrong_kind(handle, "menu", "tray icon"))
             }
@@ -373,12 +435,26 @@ impl TrayRegistry {
     fn remove_menu(&self, handle: u64) -> Result<Arc<TrayMenu>, Failure> {
         let mut entries = self.lock();
         let menu = match entries.get(&handle) {
-            Some(TrayEntry::Menu(menu)) => Arc::clone(menu),
+            Some(TrayEntry::Menu { menu, .. }) => Arc::clone(menu),
             // Only a peek: a mis-typed call must leave the record untouched,
             // exactly like every other registry lookup.
             Some(TrayEntry::Icon(_)) => return Err(wrong_kind(handle, "tray icon", "menu")),
             None => return Err(unknown_menu(handle)),
         };
+
+        // Close the callback gate while the record is still in the table and
+        // the lock is still held. A callback that is running right now (or a
+        // stale snapshot that already fetched its action) makes `close` fail:
+        // the destroy then reports a typed error and leaves the menu fully
+        // intact, so the host keeps its callbacks registered and can retry
+        // once the in-flight callback returned. Waiting inside `close` would
+        // deadlock the host thread against the tray worker - including when
+        // the callback destroys its own menu.
+        let callbacks = match entries.get(&handle) {
+            Some(TrayEntry::Menu { callbacks, .. }) => Arc::clone(callbacks),
+            _ => unreachable!("the same lock pass matched this entry above"),
+        };
+        callbacks.close()?;
 
         // Detach while the record is still in the table and the lock is still
         // held. `detach_menu_if` takes each icon's own state lock - never the
@@ -387,7 +463,7 @@ impl TrayRegistry {
         // step only compares and clears an `Option` under the icon's own lock.
         for icon in entries.values().filter_map(|entry| match entry {
             TrayEntry::Icon(icon) => Some(Arc::clone(icon)),
-            TrayEntry::Menu(_) => None,
+            TrayEntry::Menu { .. } => None,
         }) {
             icon.detach_menu_if(&menu);
         }
@@ -396,7 +472,7 @@ impl TrayRegistry {
         // removal cannot miss. The `Err` arm merely keeps the result total
         // without an `expect`.
         match entries.remove(&handle) {
-            Some(TrayEntry::Menu(_)) => Ok(menu),
+            Some(TrayEntry::Menu { .. }) => Ok(menu),
             _ => Err(unknown_menu(handle)),
         }
     }
@@ -510,7 +586,10 @@ pub(crate) fn destroy_icon(handle: u64) -> Result<(), Failure> {
 
 /// Create an empty context menu and return its registry handle.
 pub(crate) fn create_menu() -> Result<u64, Failure> {
-    let handle = TrayRegistry::global().allocate(TrayEntry::Menu(Arc::new(TrayMenu::new())));
+    let handle = TrayRegistry::global().allocate(TrayEntry::Menu {
+        menu: Arc::new(TrayMenu::new()),
+        callbacks: Arc::new(MenuCallbacks::default()),
+    });
     log::debug!("created tray menu handle {handle}");
     Ok(handle)
 }
@@ -525,7 +604,7 @@ pub(crate) fn menu_add_text(
     callback: Option<TextCallback>,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
-    let menu = TrayRegistry::global().menu(menu_handle)?;
+    let (menu, callbacks) = TrayRegistry::global().menu(menu_handle)?;
     // Push first so the core model allocates the id: it is the authority on what
     // the shell will see, and duplicating that numbering here would let the two
     // disagree. The id `push` returned is used *directly* for the trampoline -
@@ -537,10 +616,20 @@ pub(crate) fn menu_add_text(
         let payload = SendVoidPtr(user_data);
         // Re-attaching through `set_action` swaps the closure for every holder of
         // the row, which is exactly the documented core behaviour.
+        //
+        // The trampoline consults the menu's callback gate first: every copy of
+        // this closure that reaches a backend (the host state, a worker mirror,
+        // a popup snapshot) enters through the same gate, so once the menu is
+        // destroyed - and the host is told it may release its trampolines - a
+        // stale copy becomes a silent no-op instead of a call into freed host
+        // code.
         attach_action(
             &menu,
             item_id,
             TrayAction::new(move |_event: &TrayEvent| {
+                let Some(_active) = callbacks.enter() else {
+                    return;
+                };
                 callback(item_id.into_raw(), payload.raw());
             }),
         )?;
@@ -575,7 +664,7 @@ fn attach_action(
 
 /// Append a visual separator.
 pub(crate) fn menu_add_separator(menu_handle: u64) -> Result<(), Failure> {
-    let menu = TrayRegistry::global().menu(menu_handle)?;
+    let (menu, _callbacks) = TrayRegistry::global().menu(menu_handle)?;
     menu.push(MenuItem::separator())?;
     Ok(())
 }
@@ -595,7 +684,7 @@ pub(crate) fn menu_add_checkbox(
     callback: Option<CheckboxCallback>,
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
-    let menu = TrayRegistry::global().menu(menu_handle)?;
+    let (menu, callbacks) = TrayRegistry::global().menu(menu_handle)?;
     let item = if checked {
         MenuItem::checkbox_checked(label)
     } else {
@@ -616,11 +705,18 @@ pub(crate) fn menu_add_checkbox(
         // the menu reference itself and leak every row and callback with it. A
         // failed `upgrade` means the menu was destroyed while a click was
         // mid-dispatch; there is then nothing left to invert or report.
+        //
+        // The callback gate is checked before anything else: a stale copy that
+        // survives a destroy must neither reach the host's function pointer nor
+        // resurrect the model through the weak reference.
         let toggling = Arc::downgrade(&menu);
         attach_action(
             &menu,
             item_id,
             TrayAction::new(move |_event: &TrayEvent| {
+                let Some(_active) = callbacks.enter() else {
+                    return;
+                };
                 let Some(toggling) = toggling.upgrade() else {
                     return;
                 };
@@ -657,6 +753,15 @@ pub(crate) fn set_menu(tray_handle: u64, menu_handle: u64) -> Result<(), Failure
 /// from each live icon before the record disappears, so no click can ever reach
 /// the rows' callbacks once this returns. The icons themselves stay alive and
 /// simply have no menu afterwards.
+///
+/// The one exception is a callback that is running *right now* - on the tray
+/// worker, or mid-flight in a snapshot a backend already cloned. Destroying
+/// then reports `UDA_ERR_INTERNAL` with a "retry" diagnosis and leaves the menu
+/// completely intact (still attached, still callable), because the host may
+/// only release its trampolines after this call succeeds; waiting inside the
+/// destroy would deadlock the caller against the tray worker, including when
+/// the callback destroys its own menu. A host retries after its callback
+/// returns, and the retry finds `active == 0`, closes the gate and succeeds.
 pub(crate) fn destroy_menu(menu_handle: u64) -> Result<(), Failure> {
     let menu = TrayRegistry::global().remove_menu(menu_handle)?;
     let rows = menu.len();
@@ -820,6 +925,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .entries();
         assert_eq!(rows.len(), 4, "three rows and one separator");
         assert_eq!(rows[0].0.into_raw(), welcome_id);
@@ -854,6 +960,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .entries();
         // The trampoline is reachable through the row's action, which is how
         // every backend invokes it, so this exercises the real path.
@@ -892,6 +999,7 @@ mod tests {
             let rows = TrayRegistry::global()
                 .menu(menu)
                 .expect("the menu is still live")
+                .0
                 .entries();
             rows[0]
                 .1
@@ -909,6 +1017,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .entries();
         assert!(rows[0].1.state().checked, "three toggles from unchecked");
 
@@ -926,6 +1035,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .entries();
         assert_eq!(rows.len(), 1);
         // No callback means no trampoline is installed, so the row renders and
@@ -959,6 +1069,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .len();
         assert_eq!(rows, 0, "a rejected push leaves the menu untouched");
         assert!(destroy_menu(menu).is_ok());
@@ -1135,6 +1246,7 @@ mod tests {
             let rows = TrayRegistry::global()
                 .menu(menu)
                 .expect("the menu is still live")
+                .0
                 .entries();
             rows[0]
                 .1
@@ -1160,6 +1272,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .entries();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0.into_raw(), item_id);
@@ -1208,6 +1321,7 @@ mod tests {
         let rows = TrayRegistry::global()
             .menu(menu)
             .expect("the menu is still live")
+            .0
             .entries();
         assert_eq!(
             rows.len(),
@@ -1241,10 +1355,114 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_action_snapshot_cannot_fire_after_a_successful_destroy() {
+        let _guard = registry_guard();
+        TEXT_FIRES.store(0, Ordering::SeqCst);
+        let menu = create_menu().expect("menu");
+        registry_text(menu, "snapshot", Some(text_callback), std::ptr::null_mut())
+            .expect("text row");
+
+        // Clone the trampoline the way a backend does: it lives on in the
+        // worker's snapshot even after the host state is detached.
+        let stale_action = {
+            let rows = TrayRegistry::global()
+                .menu(menu)
+                .expect("the menu is still live")
+                .0
+                .entries();
+            rows[0]
+                .1
+                .action()
+                .expect("the row carries a callback")
+                .clone()
+        };
+
+        // The gate is closed *before* the record leaves the table, so the
+        // destroy succeeds and the host may release its trampolines.
+        assert!(destroy_menu(menu).is_ok(), "no callback is in flight");
+
+        // A stale snapshot that fires after the destroy must stay silent: the
+        // trampoline consults the closed gate instead of the host's pointer.
+        stale_action.invoke(&TrayEvent::Click);
+        assert_eq!(
+            TEXT_FIRES.load(Ordering::SeqCst),
+            0,
+            "a destroyed menu's snapshot must never reach the host callback"
+        );
+    }
+
+    #[test]
+    fn destroying_during_a_callback_reports_a_retryable_error() {
+        let _guard = registry_guard();
+        static MENU_HANDLE: AtomicU64 = AtomicU64::new(0);
+        static DESTROY_STATUS: AtomicU64 = AtomicU64::new(u64::MAX);
+        MENU_HANDLE.store(0, Ordering::SeqCst);
+        DESTROY_STATUS.store(u64::MAX, Ordering::SeqCst);
+
+        let menu = create_menu().expect("menu");
+        MENU_HANDLE.store(menu, Ordering::SeqCst);
+
+        // The callback destroys its own menu - legal in C, and the reason a
+        // blocking implementation would deadlock against itself.
+        extern "C" fn self_destroying_callback(_item_id: u64, _user_data: *mut c_void) {
+            let handle = MENU_HANDLE.load(Ordering::SeqCst);
+            let status = destroy_menu(handle)
+                .expect_err("a callback is in flight, so the destroy must fail")
+                .status();
+            DESTROY_STATUS.store(status.unsigned_abs() as u64, Ordering::SeqCst);
+        }
+
+        registry_text(
+            menu,
+            "self destroy",
+            Some(self_destroying_callback),
+            std::ptr::null_mut(),
+        )
+        .expect("text row");
+
+        // Invoke through the same path a backend uses.
+        let action = {
+            let rows = TrayRegistry::global()
+                .menu(menu)
+                .expect("the menu is still live")
+                .0
+                .entries();
+            rows[0]
+                .1
+                .action()
+                .expect("the row carries a callback")
+                .clone()
+        };
+        action.invoke(&TrayEvent::Click);
+
+        // The in-flight destroy was refused with the internal status and the
+        // menu survived fully attached, so the host cannot have freed anything.
+        assert_eq!(
+            DESTROY_STATUS.load(Ordering::SeqCst),
+            crate::UDA_ERR_INTERNAL.unsigned_abs() as u64,
+            "a busy destroy must report the typed retryable error"
+        );
+        assert!(
+            TrayRegistry::global().menu(menu).is_ok(),
+            "the refused destroy must leave the menu live"
+        );
+
+        // After the callback returned, the retry finds the gate quiet.
+        assert!(destroy_menu(menu).is_ok(), "the retry must succeed");
+        // And the released snapshot is now inert.
+        action.invoke(&TrayEvent::Click);
+        // (No assertion on host state needed: the callback above recorded its
+        // own single run, and this second invoke must simply not re-enter it.)
+    }
+
+    #[test]
     fn destroying_a_menu_detaches_it_from_live_icons() {
         let _guard = registry_guard();
         let menu = create_menu().expect("menu");
-        let menu_arc = TrayRegistry::global().menu(menu).expect("the menu is live");
+        let menu_arc = TrayRegistry::global()
+            .menu(menu)
+            .expect("the menu is live")
+            .0;
 
         // A real icon needs a shell, but the registry only needs the shared
         // state: build the icon the way the backends do internally and register
@@ -1270,7 +1488,10 @@ mod tests {
     fn destroying_an_unknown_menu_leaves_live_icons_alone() {
         let _guard = registry_guard();
         let menu = create_menu().expect("menu");
-        let menu_arc = TrayRegistry::global().menu(menu).expect("the menu is live");
+        let menu_arc = TrayRegistry::global()
+            .menu(menu)
+            .expect("the menu is live")
+            .0;
         let icon = Arc::new(TrayIcon::from_inner(Arc::new(TrayIconInner::new(
             "keep-test".to_string(),
         ))));

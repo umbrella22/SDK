@@ -31,7 +31,8 @@
 //! or `unreachable!()` is used on a Win32 call, and each unsafe block carries a
 //! `// SAFETY:` note naming the invariant it relies on.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::marker::PhantomPinned;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -987,6 +988,15 @@ fn lock_or_recover<'a, T>(mutex: &'a Mutex<T>, what: &str) -> MutexGuard<'a, T> 
 // Worker thread
 // ---------------------------------------------------------------------------
 
+/// A `*mut Worker` that may cross into the worker thread it is handed to.
+///
+/// `Worker`'s own `unsafe impl Send` (see its SAFETY note) already establishes
+/// that the struct is only ever owned by one thread - the one `spawn_worker`
+/// creates - so relocating the owning raw pointer to that thread carries the
+/// same guarantee.
+struct SendPtr(*mut Worker);
+unsafe impl Send for SendPtr {}
+
 /// The tray worker: owns the hidden window, the message loop and the tray icon.
 ///
 /// Everything here runs on one dedicated OS thread, which is what Win32 requires
@@ -1003,15 +1013,11 @@ struct Worker {
     /// Command-id table, filled by [`MenuTable::build`] while a popup is
     /// prepared and discarded when the host's menu changes.
     menu_table: MenuTable,
-    /// Whether this worker's modal menu tracking loop is running.
-    ///
-    /// Per-worker on purpose, not a process-wide static: re-entry can only
-    /// happen on this thread (the modal loop pumps *this* window's messages),
-    /// while a process-wide flag silently swallowed the legitimate menu
-    /// requests of every *other* tray icon's worker. The window procedure takes
-    /// `&mut Worker` per message, so the guard is set, observed and cleared
-    /// through this one field with no cross-thread synchronization.
-    menu_tracking: bool,
+    /// Per-worker guard owned independently by the modal menu session. No
+    /// reference into Worker may survive an OS call that pumps messages.
+    menu_tracking: Arc<AtomicBool>,
+    /// The address published in GWLP_USERDATA must never move.
+    _pin: PhantomPinned,
     /// Whether the shell has acknowledged `NIM_SETVERSION`.
     version_handshake_done: bool,
     /// Whether the icon was registered and still needs unregistering.
@@ -1053,7 +1059,8 @@ impl Default for Worker {
             hwnd: HWND::default(),
             icon: HICON::default(),
             menu_table: MenuTable::new(),
-            menu_tracking: false,
+            menu_tracking: Arc::new(AtomicBool::new(false)),
+            _pin: PhantomPinned,
             version_handshake_done: false,
             registered: false,
             tooltip: String::new(),
@@ -1084,8 +1091,13 @@ impl Worker {
     /// window must exist before the icon, because the shell needs an `hWnd` to
     /// post callbacks to, and the icon must exist before the version handshake,
     /// because there is nothing to version until then.
-    fn setup(&mut self, class_name: &str) -> Result<(), UdaError> {
-        let instance = self.module_handle()?;
+    /// # Safety
+    /// `worker` must point to the pinned owner on its window thread. This and
+    /// the other raw-pointer lifecycle entries never retain a Worker reference
+    /// across a call into Win32 or host code; only short state accesses may
+    /// borrow it, since those calls can synchronously re-enter the window proc.
+    unsafe fn setup(worker: *mut Self, class_name: &str) -> Result<(), UdaError> {
+        let instance = Self::module_handle()?;
         if !register_window_class(class_name, instance) {
             return Err(UdaError::Internal(
                 "could not register the tray window class".to_string(),
@@ -1093,7 +1105,9 @@ impl Worker {
         }
 
         let wide = to_utf16(class_name);
-        let title = to_utf16(&self.name());
+        // SAFETY: setup's caller keeps the pinned owner alive on this thread;
+        // this shared borrow ends before window creation can dispatch messages.
+        let title = to_utf16(&unsafe { (&*worker).name() });
         // A null parent makes this a normal top-level window, which is what
         // `WINDOW_STYLE_BITS` requires: only such a window receives the
         // `TaskbarCreated` broadcast registered below.
@@ -1126,27 +1140,23 @@ impl Worker {
         if hwnd.is_invalid() {
             return Err(UdaError::Internal("the tray window is invalid".to_string()));
         }
-        self.hwnd = hwnd;
-
-        // Hand the worker to the window procedure through user data, so the
-        // proc can reach the shared state without a global or a thread-local.
-        //
-        // SAFETY: `hwnd` was created by this thread and `GWLP_USERDATA` is a
-        // documented per-window slot on a window this thread owns. The worker
-        // outlives the window (teardown destroys the window first), and it is
-        // heap-pinned by `spawn_worker`, so `self` never moves after this write
-        // and the pointer stays valid for the window's whole life.
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, self as *mut Worker as isize);
-        }
+        // SAFETY: the pinned owner is alive; the field write finishes before
+        // publishing its address. No Worker reference is retained by this frame.
+        unsafe { (*worker).hwnd = hwnd };
+        // SAFETY: the owner outlives the window and teardown clears this slot
+        // before destroying it. Creation used null userdata, so its callbacks
+        // could not access a partially initialized Worker.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, worker as isize) };
 
         // Register for the shell's restart broadcast. The id is session-unique
         // for this string; zero means the registration failed, in which case
         // the worker will simply never see a shell restart, so the icon cannot
         // survive an explorer restart and that deserves a loud log line.
-        self.taskbar_created_msg =
+        let taskbar_created_msg =
             unsafe { RegisterWindowMessageW(windows::core::w!("TaskbarCreated")) };
-        if self.taskbar_created_msg == 0 {
+        // SAFETY: short field write with no intervening OS call.
+        unsafe { (*worker).taskbar_created_msg = taskbar_created_msg };
+        if taskbar_created_msg == 0 {
             let last = unsafe { GetLastError() };
             log::error!(
                 "RegisterWindowMessageW(TaskbarCreated) failed with Win32 error {}; \
@@ -1171,7 +1181,8 @@ impl Worker {
             )));
         }
 
-        self.add_icon()?;
+        // SAFETY: the raw entry retains no Worker borrow during registration.
+        unsafe { Self::add_icon(worker) }?;
         Ok(())
     }
 
@@ -1185,15 +1196,22 @@ impl Worker {
     /// `NIM_ADD` first, then `NIM_SETVERSION`: the shell needs an item to
     /// version, and without the handshake it silently falls back to the Windows
     /// 95 callback behaviour (`tray_specs.md` §2.2).
-    fn add_icon(&mut self) -> Result<(), UdaError> {
+    ///
+    /// # Safety
+    /// Same contract as [`Worker::setup`]: `worker` points at the pinned owner;
+    /// no `Worker` reference is held across the shell calls.
+    unsafe fn add_icon(worker: *mut Self) -> Result<(), UdaError> {
         let mut data = NOTIFYICONDATAW::default();
+        // SAFETY: short field reads; the shell call below holds no borrow.
+        let (hwnd, icon_id) = unsafe { ((*worker).hwnd, (*worker).icon_id) };
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        data.hWnd = self.hwnd;
-        data.uID = self.icon_id;
+        data.hWnd = hwnd;
+        data.uID = icon_id;
         data.uCallbackMessage = CALLBACK_MESSAGE;
 
+        // SAFETY: `shared` is an `Arc` clone; the borrow ends before the calls.
         let (tip, icon) = {
-            let shared = lock_or_recover(&self.shared, "worker add icon");
+            let shared = lock_or_recover(&unsafe { &*worker }.shared, "worker add icon");
             (
                 to_fixed_utf16::<128>(&uda_core::tray::sanitize_tooltip(&shared.tooltip)),
                 shared
@@ -1227,11 +1245,16 @@ impl Worker {
         // A shell-restart re-registration supersedes the previous handle only
         // after the shell accepted the new one; on a first registration the
         // previous handle is the invalid default and `destroy_icon` is a no-op.
-        destroy_icon(self.icon);
-        self.icon = icon;
-        // Only now is the item really registered, which is what lets `teardown`
-        // decide whether a `NIM_DELETE` is owed at all.
-        self.registered = true;
+        // SAFETY: short field access either side of the shell bookkeeping.
+        let previous = unsafe { (*worker).icon };
+        destroy_icon(previous);
+        // SAFETY: commits the accepted registration; no reentrant call between.
+        unsafe {
+            (*worker).icon = icon;
+            // Only now is the item really registered, which is what lets
+            // `teardown` decide whether a `NIM_DELETE` is owed at all.
+            (*worker).registered = true;
+        }
 
         // Version handshake. A failure is not fatal: the shell keeps using the
         // legacy callback behaviour, which still delivers clicks.
@@ -1242,8 +1265,9 @@ impl Worker {
         version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         // SAFETY: same struct, still owned by this frame.
         let handed = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &version) };
-        self.version_handshake_done = handed.as_bool();
-        if !self.version_handshake_done {
+        // SAFETY: plain field write after the call returned.
+        unsafe { (*worker).version_handshake_done = handed.as_bool() };
+        if !handed.as_bool() {
             log::debug!("NIM_SETVERSION was not acknowledged; using legacy callbacks");
         }
 
@@ -1259,27 +1283,35 @@ impl Worker {
     /// (`tooltip`, `last_icon`, `visible`) are rewritten **only on success**,
     /// so a failed update leaves them stale and the next tick retries it
     /// instead of recording a change as applied that the shell never saw.
-    fn apply_refresh(&mut self) -> bool {
-        if self.hwnd.is_invalid() {
+    ///
+    /// # Safety
+    /// Same contract as [`Worker::setup`]: `worker` points at the pinned owner;
+    /// no `Worker` reference is held across the shell call.
+    unsafe fn apply_refresh(worker: *mut Self) -> bool {
+        // SAFETY: short reads; the borrow ends before the shell call.
+        let (hwnd, icon_id, applied_icon) =
+            unsafe { ((*worker).hwnd, (*worker).icon_id, (*worker).icon) };
+        if hwnd.is_invalid() {
             return false;
         }
+        // SAFETY: `shared` is an `Arc`; the lock guard drops before any call.
         let (tooltip, icon_source, visible) = {
-            let shared = lock_or_recover(&self.shared, "worker refresh");
+            let shared = lock_or_recover(&unsafe { &*worker }.shared, "worker refresh");
             (shared.tooltip.clone(), shared.icon.clone(), shared.visible)
         };
 
         let mut data = NOTIFYICONDATAW::default();
         data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-        data.hWnd = self.hwnd;
-        data.uID = self.icon_id;
+        data.hWnd = hwnd;
+        data.uID = icon_id;
         data.uCallbackMessage = CALLBACK_MESSAGE;
         data.szTip = to_fixed_utf16::<128>(&uda_core::tray::sanitize_tooltip(&tooltip));
 
-        let mut new_icon = self.icon;
+        let mut new_icon = applied_icon;
         let mut flags = BASE_ICON_FLAGS;
         if visible {
             if let Some(source) = icon_source.as_ref() {
-                new_icon = icon_from_source(source).unwrap_or(self.icon);
+                new_icon = icon_from_source(source).unwrap_or(applied_icon);
             }
             if !new_icon.is_invalid() {
                 flags |= NIF_ICON;
@@ -1302,14 +1334,16 @@ impl Worker {
         data.uFlags = flags;
 
         // SAFETY: same window and icon id as registration, so this is the
-        // documented modify path.
+        // documented modify path. No `Worker` reference is alive here, so a
+        // sent message the shell pumps back at this window re-enters the
+        // window procedure through its own raw pointer instead of aliasing.
         let updated = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
         if !updated.as_bool() {
             log::debug!("Shell_NotifyIconW(NIM_MODIFY) failed; keeping the previous state");
             // A freshly built handle must not leak — but it may legitimately be
-            // the still-registered one (`unwrap_or(self.icon)` above), which has
-            // to survive a failed update.
-            if !new_icon.is_invalid() && new_icon != self.icon {
+            // the still-registered one (`unwrap_or(applied_icon)` above), which
+            // has to survive a failed update.
+            if !new_icon.is_invalid() && new_icon != applied_icon {
                 destroy_icon(new_icon);
             }
             return false;
@@ -1317,29 +1351,21 @@ impl Worker {
 
         // Only retire the previous icon once the shell accepted the new one,
         // so a failed update never leaves the item icon-less.
-        if !new_icon.is_invalid() && new_icon != self.icon {
-            destroy_icon(self.icon);
-            self.icon = new_icon;
+        if !new_icon.is_invalid() && new_icon != applied_icon {
+            destroy_icon(applied_icon);
+            // SAFETY: commit after the shell accepted; no call in between.
+            unsafe { (*worker).icon = new_icon };
         }
         // Record exactly what the shell now shows, so the next tick compares
         // against reality rather than against intent (and retries a failed
         // update because the cache still holds the old value).
-        self.tooltip = tooltip;
-        self.last_icon = icon_source;
-        self.visible = visible;
+        // SAFETY: plain field writes after the call returned.
+        unsafe {
+            (*worker).tooltip = tooltip;
+            (*worker).last_icon = icon_source;
+            (*worker).visible = visible;
+        }
         true
-    }
-
-    /// Discard the command-id table after the host's menu changed.
-    ///
-    /// Ids are allocated only while a popup is being prepared
-    /// ([`MenuTable::build`]), so between opens "rebuilding" means dropping:
-    /// entries left over from the last build describe a popup the shell is no
-    /// longer showing. [`Worker::on_command`] independently re-checks the
-    /// table's `source` against the menu still attached, so a command that
-    /// arrives before this tick runs is discarded there as well.
-    fn invalidate_menu_table(&mut self) {
-        self.menu_table = MenuTable::new();
     }
 
     /// Mirror the host state, then apply or tear down as needed.
@@ -1349,9 +1375,16 @@ impl Worker {
     /// callback and a host mutation can never interleave mid-update.
     ///
     /// Returns `false` when the worker must stop.
-    fn on_tick(&mut self) -> bool {
+    ///
+    /// # Safety
+    /// Same contract as [`Worker::setup`]: `worker` points at the pinned owner;
+    /// no `Worker` reference is held across the shell refresh or any call that
+    /// can pump messages.
+    unsafe fn on_tick(worker: *mut Self) -> bool {
+        // SAFETY: `shared` is an `Arc`; the guard drops before any call that
+        // could re-enter the window procedure.
         let (menu, tooltip, icon, visible, shutdown) = {
-            let mut shared = lock_or_recover(&self.shared, "tick");
+            let mut shared = lock_or_recover(&unsafe { &*worker }.shared, "tick");
             shared.sync_from();
             (
                 shared.menu.clone(),
@@ -1374,15 +1407,28 @@ impl Worker {
         // `NIM_MODIFY` is worth issuing. `apply_refresh` rewrites its caches
         // only on success, so a failed update stays dirty here and is retried
         // on the next tick instead of being recorded as applied.
-        if visible != self.visible
-            || tooltip != self.tooltip
-            || !icons_equal(icon.as_ref(), self.last_icon.as_ref())
+        // SAFETY: short field reads for the comparison only.
+        let (applied_visible, applied_tooltip, applied_icon_source) = unsafe {
+            (
+                (*worker).visible,
+                (*worker).tooltip.clone(),
+                (*worker).last_icon.clone(),
+            )
+        };
+        if visible != applied_visible
+            || tooltip != applied_tooltip
+            || !icons_equal(icon.as_ref(), applied_icon_source.as_ref())
         {
-            self.apply_refresh();
+            // SAFETY: raw entry - no borrow survives into the shell call.
+            unsafe { Self::apply_refresh(worker) };
         }
-        if !menus_equal(menu.as_ref(), self.menu.as_ref()) {
-            self.menu = menu;
-            self.invalidate_menu_table();
+        // SAFETY: short field read + write around a pure-Rust comparison.
+        let applied_menu = unsafe { (*worker).menu.clone() };
+        if !menus_equal(menu.as_ref(), applied_menu.as_ref()) {
+            unsafe {
+                (*worker).menu = menu;
+                (*worker).menu_table = MenuTable::new();
+            }
         }
         true
     }
@@ -1394,16 +1440,27 @@ impl Worker {
     /// thread parks without burning CPU and never blocks the host. The sync
     /// timer (registered by `setup`) posts `WM_TIMER` into this same loop, so
     /// everything the worker does happens on one thread.
-    fn run(&mut self) {
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner for the lifetime of the thread. The
+    /// loop deliberately holds no `Worker` reference across `DispatchMessageW`
+    /// or the tick: every reentrant window-procedure invocation builds its own
+    /// short-lived access from the same pointer, so two mutable accesses can
+    /// never be live at once.
+    unsafe fn run(worker: *mut Self) {
+        // SAFETY: short field read; `hwnd` is stable for the window's lifetime.
+        let hwnd = unsafe { (*worker).hwnd };
         // SAFETY: `msg` is a plain out-struct owned by this frame, and the loop
         // exits on `<= 0` as documented (0 = WM_QUIT, -1 = error).
         let mut msg = MSG::default();
         loop {
-            let result = unsafe { GetMessageW(&mut msg, self.hwnd, 0, 0) };
+            let result = unsafe { GetMessageW(&mut msg, hwnd, 0, 0) };
             if result.0 <= 0 {
                 break;
             }
             // SAFETY: both calls only read the message this loop dequeued.
+            // Dispatching can re-enter the window procedure; no `Worker`
+            // reference is alive across the call.
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -1411,12 +1468,13 @@ impl Worker {
 
             // The tick runs here rather than in the window procedure so it can
             // never be re-entered from inside a callback the worker dispatched.
-            if !self.on_tick() {
+            // SAFETY: raw entry - the tick owns its borrows internally.
+            if !unsafe { Self::on_tick(worker) } {
                 break;
             }
         }
 
-        self.teardown();
+        unsafe { Self::teardown(worker) };
     }
 
     /// Handle the shell's callback message.
@@ -1436,29 +1494,46 @@ impl Worker {
     ///
     /// The event-to-action mapping itself lives in
     /// [`classify_callback_event`], where it is unit-testable.
-    fn on_callback(&mut self, hwnd: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread. The handler and the
+    /// modal menu session are invoked with **no** `Worker` reference alive, so
+    /// reentrant messages the host pumps build their own access instead of
+    /// aliasing this frame's.
+    unsafe fn on_callback(
+        worker: *mut Self,
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
         let payload = unpack_callback(wparam, lparam);
         // Ignore anything addressed to a different icon in this window's set.
-        if payload.icon_id != self.icon_id {
+        // SAFETY: short field read.
+        if payload.icon_id != unsafe { (*worker).icon_id } {
             return LRESULT(0);
         }
 
         match classify_callback_event(payload.event, payload.cursor) {
-            CallbackAction::Click => self.dispatch(TrayEvent::Click),
-            CallbackAction::DoubleClick => self.dispatch(TrayEvent::DoubleClick),
+            CallbackAction::Click => unsafe { Self::dispatch(worker, TrayEvent::Click) },
+            CallbackAction::DoubleClick => unsafe {
+                Self::dispatch(worker, TrayEvent::DoubleClick)
+            },
             CallbackAction::Menu(anchor) => {
                 // While the modal tracking loop pumps messages, a further menu
                 // trigger would stack a second popup on the first; the guard
                 // turns the inner request into a no-op instead. The flag is
                 // per-worker (re-entry only ever happens on this thread), so
                 // another icon's worker is never blocked by this popup.
-                if self.menu_tracking {
+                // SAFETY: the guard is an `Arc<AtomicBool>` clone; no `Worker`
+                // reference is taken.
+                if unsafe { (*worker).menu_tracking.clone() }.load(Ordering::Acquire) {
                     log::debug!("menu trigger ignored while a popup is already tracking");
                     return LRESULT(0);
                 }
                 // A menu request is not a `TrayEvent`; it is handled inline so
                 // the shell's own event ordering is respected.
-                self.show_menu(anchor);
+                unsafe { Self::show_menu(worker, anchor) };
             }
             CallbackAction::Unhandled => {
                 // SAFETY: fall through to the default handler for everything
@@ -1473,10 +1548,17 @@ impl Worker {
     ///
     /// The callback is taken out of the state and put back afterwards, so a host
     /// that mutates the icon from inside its own handler cannot deadlock
-    /// against this thread.
-    fn dispatch(&mut self, event: TrayEvent) {
+    /// against this thread. The handler itself runs with **no** `Worker`
+    /// reference alive: a host callback that pumps messages re-enters the
+    /// window procedure through its own pointer access instead of aliasing.
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread.
+    unsafe fn dispatch(worker: *mut Self, event: TrayEvent) {
+        // SAFETY: `shared` is an `Arc` clone; the guard drops before the call.
+        let shared = unsafe { &*worker }.shared.clone();
         let handler = {
-            let mut shared = lock_or_recover(&self.shared, "dispatch");
+            let mut shared = lock_or_recover(&shared, "dispatch");
             match event {
                 TrayEvent::Click => shared.on_click.take(),
                 TrayEvent::DoubleClick => shared.on_double_click.take(),
@@ -1484,7 +1566,7 @@ impl Worker {
         };
         if let Some(mut handler) = handler {
             handler(&event);
-            let mut shared = lock_or_recover(&self.shared, "dispatch restore");
+            let mut shared = lock_or_recover(&shared, "dispatch restore");
             match event {
                 TrayEvent::Click => shared.on_click = Some(handler),
                 TrayEvent::DoubleClick => shared.on_double_click = Some(handler),
@@ -1495,20 +1577,24 @@ impl Worker {
     /// Build and show the context menu.
     ///
     /// The work is split in two so no borrow of the worker is alive while the
-    /// modal loop pumps messages: everything touching `self` happens in
+    /// modal loop pumps messages: everything touching the worker happens in
     /// [`Worker::prepare_menu`], and tracking runs from plain locals
-    /// ([`MenuSession`]). The window procedure, which takes `&mut Worker` from
-    /// `GWLP_USERDATA`, can therefore re-enter freely — any `WM_COMMAND`, click
-    /// handler or menu trigger it serves behaves exactly as it would without a
-    /// menu open. The chosen command id is forwarded through the message queue
-    /// ([`MENU_COMMAND_MESSAGE`]) so its invocation also runs under a fresh,
-    /// exclusive worker borrow.
-    fn show_menu(&mut self, anchor: MenuAnchor) {
-        // `session` owns only plain values, so the borrow of `self` ends here;
-        // the tracking guard is handed over as a plain `&mut bool` so the modal
-        // loop can set and release it without touching the worker again.
-        if let Some(session) = self.prepare_menu(anchor) {
-            session.track(&mut self.menu_tracking);
+    /// ([`MenuSession`]). The window procedure re-enters freely during
+    /// `TrackPopupMenuEx` — any `WM_COMMAND`, click handler or menu trigger it
+    /// serves builds its own short-lived access from the pinned pointer
+    /// instead of aliasing this frame. The chosen command id is forwarded
+    /// through the message queue ([`MENU_COMMAND_MESSAGE`]) so its invocation
+    /// also runs under a fresh access.
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread.
+    unsafe fn show_menu(worker: *mut Self, anchor: MenuAnchor) {
+        // SAFETY: `prepare_menu` releases every borrow before tracking starts,
+        // and the tracking guard is an owned `Arc<AtomicBool>`.
+        if let Some(session) = unsafe { Self::prepare_menu(worker, anchor) } {
+            // SAFETY: short field read producing an owned guard clone.
+            let guard = unsafe { (*worker).menu_tracking.clone() };
+            session.track(guard);
         }
     }
 
@@ -1518,9 +1604,16 @@ impl Worker {
     /// snapshot of the rows at build time, and the host may have mutated it
     /// since it was last shown), resolves the anchor point and claims
     /// foreground status.
-    fn prepare_menu(&mut self, anchor: MenuAnchor) -> Option<MenuSession> {
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread. `SetForegroundWindow`
+    /// can pump sent messages, so it runs with no `Worker` reference alive.
+    unsafe fn prepare_menu(worker: *mut Self, anchor: MenuAnchor) -> Option<MenuSession> {
+        // SAFETY: short field read producing an owned `Arc` clone.
+        let shared = unsafe { &*worker }.shared.clone();
+        // SAFETY: the guard drops before any call that can pump messages.
         let menu = {
-            let shared = lock_or_recover(&self.shared, "show menu");
+            let shared = lock_or_recover(&shared, "show menu");
             shared.menu.clone()
         };
         let menu = menu?;
@@ -1531,7 +1624,17 @@ impl Worker {
         // — once for the table and once for the `HMENU` — which doubled the
         // table, left dead ids that could never be chosen, and filled `trace`
         // with entries the shell could never send.)
-        let popup = self.menu_table.build(&menu)?;
+        //
+        // The mutable worker borrow intentionally spans `build`'s Win32 menu
+        // calls: `CreatePopupMenu`/`AppendMenuW` never pump messages and never
+        // send to this window, so the window procedure cannot re-enter while
+        // the borrow is alive and no alias can arise. What the borrow must
+        // never span is a call that *can* re-enter (a pump or a host
+        // callback) - those all run borrow-free below.
+        //
+        // SAFETY: short mutable borrow for the table rebuild, on the pinned
+        // owner of this thread.
+        let popup = unsafe { Self::build_menu_table(worker, &menu) }?;
 
         // One read serves both fallbacks; `resolve_menu_anchor` holds the
         // policy, and a failed query is not fatal because the alignment flags
@@ -1544,9 +1647,11 @@ impl Worker {
         };
         let point = resolve_menu_anchor(anchor, live_cursor);
 
+        // SAFETY: short field read; the window call below holds no borrow.
+        let hwnd = unsafe { (*worker).hwnd };
         // SAFETY: `hwnd` is this thread's window; making it foreground is the
         // documented requirement for a dismissible popup.
-        let foreground = unsafe { SetForegroundWindow(self.hwnd) };
+        let foreground = unsafe { SetForegroundWindow(hwnd) };
         if !foreground.as_bool() {
             // The call is what lets the popup dismiss on an outside click, so a
             // failure (typically the foreground-lock timeout) degrades the
@@ -1557,11 +1662,27 @@ impl Worker {
             log::warn!("SetForegroundWindow failed; the menu may not dismiss on an outside click");
         }
 
-        Some(MenuSession {
-            hwnd: self.hwnd,
-            popup,
-            point,
-        })
+        Some(MenuSession { hwnd, popup, point })
+    }
+
+    /// Rebuild the command-id table from `menu` and build the popup.
+    ///
+    /// Split from [`Worker::prepare_menu`] so the mutable worker access stays
+    /// in one place. The borrow spans `build`'s `CreatePopupMenu` /
+    /// `AppendMenuW` calls, which cannot re-enter this window (they never pump
+    /// messages nor send to it), so no alias can arise.
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread.
+    unsafe fn build_menu_table(
+        worker: *mut Self,
+        menu: &std::sync::Arc<uda_core::tray::TrayMenu>,
+    ) -> Option<HMENU> {
+        // SAFETY: exclusive access for the table rebuild; the Win32 calls
+        // inside `build` cannot re-enter this window's procedure.
+        let worker = unsafe { &mut *worker };
+        let popup = worker.menu_table.build(menu)?;
+        Some(popup)
     }
 
     /// Re-register the icon after the shell restarted (`TaskbarCreated`).
@@ -1570,24 +1691,34 @@ impl Worker {
     /// worker re-adds the icon from its mirrored state. A refusal is not fatal:
     /// the next `TaskbarCreated` or the sync tick still sees a consistent
     /// worker.
-    fn on_taskbar_created(&mut self) {
-        if self.hwnd.is_invalid() {
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread; the shell calls run
+    /// with no `Worker` reference alive (see [`Worker::add_icon`]).
+    unsafe fn on_taskbar_created(worker: *mut Self) {
+        // SAFETY: short field read.
+        let hwnd = unsafe { (*worker).hwnd };
+        if hwnd.is_invalid() {
             return;
         }
         log::debug!("shell restarted; re-registering the tray icon");
         // explorer forgot the item, so the local flag must be cleared before
         // the re-add: `add_icon` sets it again only on success.
-        self.registered = false;
-        if let Err(error) = self.add_icon() {
+        // SAFETY: plain field write before the re-registration call.
+        unsafe { (*worker).registered = false };
+        // SAFETY: raw entry; no borrow survives into the shell round-trip.
+        if let Err(error) = unsafe { Self::add_icon(worker) } {
             log::warn!("could not re-register the tray icon after a shell restart: {error}");
             return;
         }
-        if !self.visible {
+        // SAFETY: short field read.
+        if !unsafe { (*worker).visible } {
             // `add_icon` registers the icon shown. Flip the applied cache back
             // to "visible" so the next tick sees a difference from the hidden
             // mirror and re-applies `NIS_HIDDEN`; a failed hide is retried
             // there too, because the caches only advance on success.
-            self.visible = true;
+            // SAFETY: plain field write.
+            unsafe { (*worker).visible = true };
         }
     }
 
@@ -1608,28 +1739,41 @@ impl Worker {
     /// already cloned into the worker's table. Identity comparison cannot close
     /// every race (a host mutating the same `TrayMenu` in place is invisible to
     /// it), but it covers the window the message queue opens.
-    fn on_command(&mut self, command_id: u16) {
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread. The action runs with
+    /// **no** `Worker` reference alive, so a host callback that pumps messages
+    /// re-enters through its own pointer access instead of aliasing.
+    unsafe fn on_command(worker: *mut Self, command_id: u16) {
         if command_id == 0 {
             return;
         }
-        let attached = lock_or_recover(&self.shared, "menu command").menu.clone();
-        if !menus_equal(self.menu_table.source.as_ref(), attached.as_ref()) {
-            log::debug!("tray command {command_id} dropped: its menu is no longer attached");
-            return;
-        }
-        let action = self.menu_table.action_for(command_id);
-        if action.is_some() {
-            log::debug!("tray command {command_id} resolved to a row");
-        } else {
-            log::debug!("tray command {command_id} matched no row");
-        }
+        // SAFETY: short borrows; the action is cloned out and the borrows end
+        // before the invocation below.
+        let action = unsafe {
+            let w = &*worker;
+            let attached = lock_or_recover(&w.shared, "menu command").menu.clone();
+            if !menus_equal(w.menu_table.source.as_ref(), attached.as_ref()) {
+                log::debug!("tray command {command_id} dropped: its menu is no longer attached");
+                None
+            } else {
+                let action = w.menu_table.action_for(command_id);
+                if action.is_some() {
+                    log::debug!("tray command {command_id} resolved to a row");
+                } else {
+                    log::debug!("tray command {command_id} matched no row");
+                }
+                action
+            }
+        };
+        // The invocation is the only out-call here and runs borrow-free.
         if let Some(action) = action {
             action.invoke(&TrayEvent::Click);
         }
     }
 
     /// The module handle for this executable.
-    fn module_handle(&self) -> Result<windows::Win32::Foundation::HMODULE, UdaError> {
+    fn module_handle() -> Result<windows::Win32::Foundation::HMODULE, UdaError> {
         // SAFETY: a null module name asks for the current executable's image;
         // no invariants beyond the documented call.
         match unsafe { GetModuleHandleW(None) } {
@@ -1647,27 +1791,38 @@ impl Worker {
     /// `NIM_DELETE` runs *before* the window is destroyed, otherwise the shell
     /// keeps a dangling `hWnd` and may show a ghost icon until logoff
     /// (`tray_specs.md` §2.7).
-    fn teardown(&mut self) {
+    ///
+    /// # Safety
+    /// `worker` points at the pinned owner on this thread. `DestroyWindow`
+    /// dispatches `WM_DESTROY`/`WM_NCDESTROY` synchronously, so it runs with no
+    /// `Worker` reference alive; the reentrant window procedure sees a null
+    /// `GWLP_USERDATA` after `WM_NCDESTROY` and stays out of the worker.
+    unsafe fn teardown(worker: *mut Self) {
+        // SAFETY: short field read; the handle stays valid until DestroyWindow.
+        let hwnd = unsafe { (*worker).hwnd };
         // Stop the heartbeat first: no tick may fire while the icon is being
         // unregistered, or it would try to refresh an item mid-deletion. The
         // timer is killed whenever the window exists (not only on a successful
         // registration) because `setup` creates it before `add_icon`; killing
         // an id the window has no timer for is a harmless no-op.
-        if !self.hwnd.is_invalid() {
+        if !hwnd.is_invalid() {
             // SAFETY: `hwnd` is this thread's live window and the timer id is
             // the one `setup` registered.
             unsafe {
-                let _ = KillTimer(self.hwnd, SYNC_TIMER_ID);
+                let _ = KillTimer(hwnd, SYNC_TIMER_ID);
             }
 
             // A window with no registration owed the shell nothing, so the
             // `NIM_DELETE` is skipped entirely rather than issued against an id
             // the shell may have recycled for another item.
-            if self.registered {
+            // SAFETY: short field read.
+            let registered = unsafe { (*worker).registered };
+            if registered {
                 let mut data = NOTIFYICONDATAW::default();
                 data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
-                data.hWnd = self.hwnd;
-                data.uID = self.icon_id;
+                data.hWnd = hwnd;
+                // SAFETY: short field read.
+                data.uID = unsafe { (*worker).icon_id };
                 // SAFETY: same window and id as registration; the shell forgets
                 // the item immediately, so no other field has to be filled.
                 let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
@@ -1676,17 +1831,23 @@ impl Worker {
                 }
                 // Either way the item is gone from this worker's point of view;
                 // a second teardown must not try again.
-                self.registered = false;
+                // SAFETY: plain field write after the call returned.
+                unsafe { (*worker).registered = false };
             }
         }
 
-        destroy_icon(self.icon);
-        self.icon = HICON::default();
+        // SAFETY: short field read.
+        let icon = unsafe { (*worker).icon };
+        destroy_icon(icon);
+        // SAFETY: plain field write.
+        unsafe { (*worker).icon = HICON::default() };
 
-        if !self.hwnd.is_invalid() {
+        if !hwnd.is_invalid() {
             // SAFETY: this thread created the window and owns its message loop.
-            let _ = unsafe { DestroyWindow(self.hwnd) };
-            self.hwnd = HWND::default();
+            // The (reentrant) destroy messages run with no borrow held.
+            let _ = unsafe { DestroyWindow(hwnd) };
+            // SAFETY: plain field write after the window is gone.
+            unsafe { (*worker).hwnd = HWND::default() };
         }
     }
 }
@@ -1709,16 +1870,19 @@ impl MenuSession {
     /// Run the modal tracking loop and forward the chosen command id.
     ///
     /// The id is posted back as [`MENU_COMMAND_MESSAGE`] instead of returned,
-    /// because resolving it needs the worker and the caller holds no borrow of
-    /// it across (or after) the modal loop. A failed forward is logged as an
-    /// error — the choice is then lost, which is strictly worse than a failed
-    /// menu build.
-    fn track(self, menu_tracking: &mut bool) {
+    /// because resolving it needs the worker and this frame deliberately holds
+    /// no reference to it across (or after) the modal loop. A failed forward is
+    /// logged as an error — the choice is then lost, which is strictly worse
+    /// than a failed menu build.
+    ///
+    /// The tracking guard is an owned `Arc<AtomicBool>`: the window procedure
+    /// re-entered by the modal loop reads the same guard through the worker's
+    /// pinned pointer, so no borrow of the worker survives into `TrackPopupMenuEx`.
+    fn track(self, menu_tracking: Arc<AtomicBool>) {
         // The window procedure ignores further menu triggers while this is
-        // set; it reads the same worker field through `&mut Worker` on every
-        // nested message, so the nested trigger sees it before any pumping
-        // starts and the flag never has to be process-wide.
-        *menu_tracking = true;
+        // set; the nested trigger sees it before any pumping starts and the
+        // flag never has to be process-wide.
+        menu_tracking.store(true, Ordering::Release);
 
         // SAFETY: `popup` is live, `hwnd` is live, and no `TPMPARAMS` is needed
         // for a simple popup. `TPM_RETURNCMD` hands the chosen id back instead
@@ -1742,7 +1906,7 @@ impl MenuSession {
 
         // The modal loop is done; release the guard before any later message
         // could legitimately be treated as a menu request again.
-        *menu_tracking = false;
+        menu_tracking.store(false, Ordering::Release);
 
         // `popup` is no longer referenced by the shell once `TrackPopupMenuEx`
         // returned.
@@ -1828,6 +1992,12 @@ fn unregister_window_class(class_name: &str) {
 /// thin trampoline: it hands UDA's own messages to the worker and defers
 /// everything else to `DefWindowProcW`.
 ///
+/// The pointer is used **raw**: this frame never forms a long-lived `&mut
+/// Worker`, because messages can re-enter (the modal menu loop, a host callback
+/// that pumps, a sent message pumped while a shell call blocks). Every handler
+/// builds its own short-lived access from the same pointer, so two mutable
+/// accesses are never live at once — which is what makes the re-entrancy sound.
+///
 /// # Safety
 ///
 /// An `extern "system"` callback invoked by Win32 under the documented window
@@ -1861,29 +2031,32 @@ unsafe extern "system" fn tray_window_proc(
     }
 
     // SAFETY: `GWLP_USERDATA` was written by the thread that owns this window,
-    // with a pointer to the worker, which is alive for the window's lifetime.
+    // with a pointer to the pinned worker, which is alive for the window's
+    // lifetime (teardown clears the slot before the window dies).
     let worker = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Worker;
     if !worker.is_null() {
-        // SAFETY: the pointer is non-null and the worker outlives the window
-        // (teardown destroys the window before the worker is dropped).
-        let worker = unsafe { &mut *worker };
         if message == CALLBACK_MESSAGE {
-            return worker.on_callback(hwnd, message, wparam, lparam);
+            // SAFETY: raw entry - the handler owns its borrows internally.
+            return unsafe { Worker::on_callback(worker, hwnd, message, wparam, lparam) };
         }
         // The shell's restart broadcast. Zero never matches (no registered
         // message id can be 0), which is what keeps a failed registration from
         // turning every `WM_NULL` into a re-registration attempt.
-        if worker.taskbar_created_msg != 0 && message == worker.taskbar_created_msg {
+        // SAFETY: short field read.
+        let taskbar_created_msg = unsafe { (*worker).taskbar_created_msg };
+        if taskbar_created_msg != 0 && message == taskbar_created_msg {
             // explorer.exe (re)started and forgot the icon; re-register it. A
             // broadcast is a notification, not a request for a default handler,
             // so it ends here.
-            worker.on_taskbar_created();
+            // SAFETY: raw entry - the handler owns its borrows internally.
+            unsafe { Worker::on_taskbar_created(worker) };
             return LRESULT(0);
         }
         if message == WM_COMMAND || message == MENU_COMMAND_MESSAGE {
             // The low word of `wParam` is the command id, both for a shell-posted
             // `WM_COMMAND` and for the id forwarded out of the modal menu loop.
-            worker.on_command((wparam.0 & 0xFFFF) as u16);
+            // SAFETY: raw entry - the action runs with no worker reference.
+            unsafe { Worker::on_command(worker, (wparam.0 & 0xFFFF) as u16) };
             return LRESULT(0);
         }
     }
@@ -1946,40 +2119,66 @@ impl WindowsTrayManager {
         // Every backend-facing field starts invalid/empty; only the shared state
         // and the shell-side id come from the caller.
         //
-        // The `Box` is load-bearing, not stylistic: `setup` writes
-        // `self as *mut Worker` into the window's `GWLP_USERDATA`, and the
-        // window procedure later dereferences it. A stack-resident `Worker`
-        // would make that address depend on the closure's stack frame, which
-        // the compiler is free to relocate or reclaim. Boxing pins the struct to
-        // one heap allocation for the whole thread, so the pointer stays valid
-        // until `teardown` clears the slot.
-        let worker = Box::new(Worker {
+        // The heap `Box` is load-bearing, not stylistic: `setup` writes the
+        // worker's address into the window's `GWLP_USERDATA`, and the window
+        // procedure later dereferences it. `into_raw` pins the struct to one
+        // heap allocation for the whole thread (the `PhantomPinned` field makes
+        // the guarantee explicit), so the published address stays valid until
+        // the box is reconstructed and dropped after `run` returns.
+        let worker: *mut Worker = Box::into_raw(Box::new(Worker {
             shared,
             icon_id,
             ..Worker::default()
-        });
+        }));
+        // SAFETY: the pointer comes straight from `Box::into_raw`, so the
+        // reconstruction below returns it to the allocator exactly once; the
+        // wrapper is what lets the raw pointer cross into the worker thread.
+        let owned = SendPtr(worker);
         let worker_name = class_name.clone();
 
         let handle = std::thread::Builder::new()
             .name("uda-tray-worker".to_string())
             .spawn(move || {
+                // Move the whole wrapper in first: precise closure capture
+                // would otherwise capture the `*mut Worker` field place, which
+                // is not `Send` on its own.
+                let owned = owned;
+                let worker = owned.0;
                 // `setup` and the message loop are separate so a failure can be
-                // reported before the (blocking) loop starts. Moving the `Box`
-                // here moves only the pointer word; the heap `Worker` stays put,
-                // which is what keeps the `GWLP_USERDATA` pointer honest.
-                let mut worker = worker;
-                if let Err(error) = worker.setup(&worker_name) {
+                // reported before the (blocking) loop starts.
+                //
+                // SAFETY: `worker` is the pinned owner on this thread, and the
+                // raw lifecycle entries hold no `Worker` reference across an
+                // OS call, so reentrant window-procedure invocations cannot
+                // alias a live borrow.
+                let started = unsafe { Worker::setup(worker, &worker_name) };
+                if let Err(error) = started {
                     log::warn!("tray worker could not start: {error}");
-                    worker.teardown();
+                    // SAFETY: same pinned owner; teardown is idempotent.
+                    unsafe { Worker::teardown(worker) };
                     unregister_window_class(&worker_name);
                     let _ = ready.try_send(Err(error.to_string()));
+                    // SAFETY: the window is gone (no `GWLP_USERDATA` points
+                    // here any more), so the worker can be freed.
+                    drop(unsafe { Box::from_raw(worker) });
                     return;
                 }
                 let _ = ready.try_send(Ok(String::new()));
-                worker.run();
+                // SAFETY: the pinned owner outlives the loop; the loop holds no
+                // `Worker` reference across a message dispatch.
+                unsafe { Worker::run(worker) };
                 unregister_window_class(&worker_name);
+                // SAFETY: `run`'s teardown destroyed the window, so nothing
+                // references the worker any more.
+                drop(unsafe { Box::from_raw(worker) });
             })
-            .map_err(|error| {
+            .map_err(move |error| {
+                // The closure that owned the worker was dropped with the failed
+                // spawn, and `SendPtr` has no `Drop` - free the pinned owner
+                // here, or the heap `Worker` (and its shared state) leaks.
+                // SAFETY: the thread never ran, so no window ever published
+                // the pointer; this is the sole remaining owner.
+                drop(unsafe { Box::from_raw(worker) });
                 UdaError::Internal(format!("could not spawn the tray worker: {error}"))
             })?;
 

@@ -9,16 +9,9 @@
 //! | Windows| `uda_platform_windows::appearance` | `uda_platform_windows::wallpaper` | `uda_platform_windows::wakelock` |
 //! | Other  | `UnsupportedBackend` | `UnsupportedBackend` | CLI tier only |
 //!
-//! Per `AGENTS.md` Principle 2 (Cascading Fallback Engine), each Linux feature
-//! keeps its full tier chain. The `uda-platform-linux` crate implements Tiers
-//! 1–2 for appearance and wallpaper; this module adds the **Tier 3** CLI probes
-//! for the two capabilities whose platform crates deliberately punt, so the FFI
-//! surface stays useful on a bare window manager:
-//!
-//! - `get_wallpaper` -> `gsettings get org.gnome.desktop.background picture-uri`
-//! - `wakelock_acquire` -> `systemd-inhibit --what=... sleep <seconds>`
-
-use std::process::Command;
+//! Wallpaper reads and writes are owned by the platform manager, including its
+//! CLI fallback chain, timeout policy and reply decoding. Dispatch only maps the
+//! result onto the C ABI's optional path contract.
 
 // The trait imports are required: the platform managers implement these traits
 // rather than exposing inherent methods, and calling them without the traits in
@@ -126,95 +119,7 @@ pub(crate) fn set_wallpaper(path: &str, fill_mode: FillMode) -> Result<(), Failu
 /// written on this path - success carries no diagnosis, so there is nothing to
 /// distinguish the two cases with.
 pub(crate) fn get_wallpaper_path() -> Result<Option<String>, Failure> {
-    if let Some(path) = wallpaper().get_wallpaper().ok().flatten() {
-        return Ok(Some(path));
-    }
-
-    // Tier 3: the platform trait may not implement the read (Linux currently
-    // returns `NotSupported`), so probe the standard CLI tools before giving up.
-    Ok(cli_wallpaper_path())
-}
-
-/// Ask the standard desktop CLIs for the configured wallpaper path.
-///
-/// The only CLI probed is `gsettings`, which speaks for GNOME-family sessions
-/// alone. On KDE, Hyprland or a bare window manager the GNOME schema may still
-/// exist (it is commonly installed as a dependency), but nothing applies that
-/// value, so reporting it would answer a different desktop's question. The
-/// probe is therefore gated on `XDG_CURRENT_DESKTOP`.
-///
-/// `None` is the answer whenever the probe cannot produce a path - a missing
-/// tool, a non-zero exit, empty output, or a non-GNOME session.
-fn cli_wallpaper_path() -> Option<String> {
-    if !session_is_gnome_family() {
-        log::debug!("gsettings wallpaper probe skipped: not a GNOME-family session");
-        return None;
-    }
-
-    let raw = run_capture(
-        "gsettings",
-        &["get", "org.gnome.desktop.background", "picture-uri"],
-    )?;
-
-    // `gsettings` prints a GVariant string literal, quotes included.
-    let unquoted = raw.trim().trim_matches(|c| c == '\'' || c == '"');
-    if unquoted.is_empty() {
-        return None;
-    }
-    Some(strip_file_scheme(unquoted))
-}
-
-/// Whether `XDG_CURRENT_DESKTOP` names a GNOME-family session.
-///
-/// The variable is a colon-separated list such as `ubuntu:GNOME`; entries are
-/// matched case-insensitively because the spec leaves the case to the session.
-/// An unset or unreadable variable means "not GNOME": the probe is a GNOME-only
-/// affordance, so absence of evidence defaults to refusing it.
-fn session_is_gnome_family() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|value| is_gnome_family_desktop(&value))
-}
-
-/// [`session_is_gnome_family`] with the environment value injected, so tests
-/// never touch process-global state.
-fn is_gnome_family_desktop(value: &str) -> bool {
-    value.split(':').any(|entry| {
-        let entry = entry.trim();
-        entry.eq_ignore_ascii_case("GNOME") || entry.eq_ignore_ascii_case("Unity")
-    })
-}
-
-/// Drop a leading `file://` scheme so callers receive a plain filesystem path.
-fn strip_file_scheme(value: &str) -> String {
-    value
-        .strip_prefix("file://")
-        .map(str::to_owned)
-        .unwrap_or_else(|| value.to_owned())
-}
-
-/// Run a command and return its trimmed stdout when it succeeded and printed.
-///
-/// A spawn failure, a non-zero exit and empty output all mean "no answer": the
-/// probe is best-effort, so the reason is logged for diagnostics and the caller
-/// sees `None` instead of a typed error it would only discard.
-fn run_capture(program: &str, args: &[&str]) -> Option<String> {
-    let output = match Command::new(program).args(args).output() {
-        Ok(output) => output,
-        Err(error) => {
-            log::debug!("{program} probe failed: {error}");
-            return None;
-        }
-    };
-
-    if !output.status.success() {
-        log::debug!("{program} probe exited unsuccessfully: {}", output.status);
-        return None;
-    }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if text.is_empty() {
-        None
-    } else {
-        Some(text)
-    }
+    Ok(wallpaper().get_wallpaper().ok().flatten())
 }
 
 /// Acquire a wake lock, returning a handle that [`release_wakelock`] accepts.
@@ -369,18 +274,6 @@ mod tests {
     }
 
     #[test]
-    fn file_scheme_is_stripped_from_paths() {
-        assert_eq!(
-            strip_file_scheme("file:///home/user/wall.jpg"),
-            "/home/user/wall.jpg"
-        );
-        assert_eq!(
-            strip_file_scheme("/home/user/wall.jpg"),
-            "/home/user/wall.jpg"
-        );
-    }
-
-    #[test]
     fn detect_theme_reports_a_documented_code() {
         match detect_theme_code() {
             // Any of the three codes is acceptable; what matters is that a
@@ -408,29 +301,6 @@ mod tests {
                 other => panic!("expected InvalidArgument for {path:?}, got {other:?}"),
             }
         }
-    }
-
-    #[test]
-    fn the_gsettings_probe_only_trusts_gnome_family_sessions() {
-        // Exactly the sessions the GNOME schema actually governs: plain GNOME,
-        // the Unity derivative, and colon-separated composite names, all
-        // case-insensitively.
-        assert!(is_gnome_family_desktop("GNOME"));
-        assert!(is_gnome_family_desktop("gnome"));
-        assert!(is_gnome_family_desktop("Unity"));
-        assert!(is_gnome_family_desktop("ubuntu:GNOME"));
-        assert!(is_gnome_family_desktop("KDE:GNOME"));
-        assert!(is_gnome_family_desktop(" ubuntu : GNOME "));
-
-        // Everything else must refuse, including entries that merely contain
-        // the name as a substring: a per-entry match is what keeps KDE's or a
-        // tiling WM's stray GNOME schema from being reported as the wallpaper.
-        assert!(!is_gnome_family_desktop("KDE"));
-        assert!(!is_gnome_family_desktop("Hyprland"));
-        assert!(!is_gnome_family_desktop("GNOME-Flashback"));
-        assert!(!is_gnome_family_desktop("unity-session"));
-        assert!(!is_gnome_family_desktop(""));
-        assert!(!is_gnome_family_desktop(":"));
     }
 
     #[test]

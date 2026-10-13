@@ -21,7 +21,7 @@
 | `SessionAction::Hibernate` | `org.freedesktop.login1.Manager.Hibernate(false)` | `powrprof!SetSuspendState(true, false, false)` |
 | `SessionAction::Reboot` | `org.freedesktop.login1.Manager.Reboot(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_REBOOT \| EWX_FORCEIFHUNG, 0)` |
 | `SessionAction::Shutdown` | `org.freedesktop.login1.Manager.PowerOff(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_POWEROFF \| EWX_FORCEIFHUNG, 0)` |
-| `Capability::SESSION_MANAGEMENT` | logind 调用者会话可解析，或桌面会话管理器可达（判据见第 5 节） | Win32 会话/电源 API 存在 |
+| `Capability::SESSION_MANAGEMENT` | logind 调用者自身会话可解析，或桌面注销管理器已持有/可激活（判据见第 5 节） | Win32 会话/电源 API 存在 |
 | `Capability::LOCK` / `LOGOUT` / ... | 探测到对应接收方可达（逐位判据见第 5 节） | Win32 API 存在 |
 
 ### 1.1 能力位（ABI 稳定）
@@ -218,22 +218,32 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
 - **能力位表达"查询时有接收方可达"，不是"账户被允许"。** 关掉休眠的机器
   （logind 仍可达）仍上报 `Capability::HIBERNATE`；真正拒绝发生在运行时，成为
   `UdaError::NotSupported`。这与 Linux 的 polkit、Windows 的 1314 完全对称。
-- Linux 后端按运行时探测上报（结果按进程缓存一次，探测失败按不可达处理）。
-  探测分两层：`org.freedesktop.login1` 在系统总线上可达（manager 级），以及
-  **调用者会话可解析**（会话对象级——`lock-session` 与 `TerminateSession("")`
-  都解析调用者自己的会话，即 logind 的特殊 `session/auto` 对象）。"名字被
-  own" 只证明 daemon 在跑（systemd 一启动 logind 就 own 该名字），
-  `ListSessions` 非空也只证明机器上存在会话对象（启用了 systemd 的 WSL2 会为
-  SSH/PTY 建立会话，却仍解析不出调用者的 seat 会话）——所以探测先列会话、再
-  调 `GetSession("auto")` 做对象级校验，二者皆过才算"调用者有会话"。据此渲染
-  矩阵：调用者会话可解析 → 全部七位；logind 可达但调用者无会话 → 仅四个电源
-  位（SUSPEND/HIBERNATE/REBOOT/SHUTDOWN，manager 级动作，不依赖会话），若此
-  时 ScreenSaver 也可达则再加 LOCK（lock 的 Tier-2 就是它）；仅
-  `org.freedesktop.ScreenSaver` 可达 → 只有 `Capability::LOCK`；两条总线皆
-  不可达（如容器、`dbus-run-session` 沙箱）→ 空集。`LOGOUT` 还有一个独立
-  接收方：GNOME/KDE/XFCE 桌面会话管理器（`logout()` 的 Tier-3 兜底，探测与
-  执行体拨同一组服务名）——logind 解析不出调用者会话但桌面会话管理器可达的
-  传统 X11 桌面，`LOGOUT`/`SESSION_MANAGEMENT` 照常置位。
+- Linux 后端按运行时探测上报，结果按进程缓存一次。接收方分开判断，能力不是授权承诺：
+
+  | 能力 | 接收方判据 |
+  |---|---|
+  | SUSPEND / HIBERNATE / REBOOT / SHUTDOWN | system bus 上 logind manager 可达，不依赖会话对象 |
+  | LOCK | session bus 上 ScreenSaver 已持有服务名，或 logind `GetSession("auto")` 可解析 |
+  | LOGOUT / SESSION_MANAGEMENT | logind `GetSession("")` 可解析调用者自身会话，或桌面注销 manager 的名字已持有或可激活 |
+
+  `auto` 优先解析调用者会话，调用者没有会话时可以退到该用户的 display session，
+  与无参数 `loginctl lock-session` 的 `session/auto` 目标一致；空字符串只解析
+  caller-self，与实际 `TerminateSession("")` 一致。仅有 display session 的用户
+  服务可声明 LOCK，但不能据此声明 LOGOUT / SESSION_MANAGEMENT。注销执行仍传
+  空字符串，绝不扩大为 display session。
+
+  logind 会话探测共用一次连接、proxy 和 `ListSessions`；列表为空时两个会话
+  判据均为 false，非空后分别调用 `GetSession("auto")` 与 `GetSession("")`。
+  两次解析独立处理错误与超时，一次失败不覆盖另一次结果，也不撤下 manager
+  已证明可达的四个电源位。
+
+  caller-self 不可解析时，桌面注销探测查询 session bus 的 `ListNames` 与
+  `ListActivatableNames`，对两份结果的并集精确匹配执行体的 GNOME/KDE/XFCE
+  服务名。包括尚未启动、仅登记按需激活的 `org.kde.Shutdown`。列名字不会激活
+  服务或调用注销；可激活意味着总线有投递路径，实际激活失败或策略拒绝仍在
+  执行时处理。两个列表各自有界，单个查询失败不抹掉另一份列表已证明的接收方。
+  无任何接收方时为空集；只有 ScreenSaver 时只有 LOCK；只有桌面注销 manager
+  时只有 LOGOUT / SESSION_MANAGEMENT。
 - Windows 后端仍无条件上报全部七位：Win10/11 都有这四个 API，接收方恒可达；
   权限是运行时问题（1300/1314），不是能力问题。
 - 非 Linux / 非 Windows 目标：`capabilities()` 返回空集，六个动作一律

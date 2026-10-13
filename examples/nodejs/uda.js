@@ -1395,12 +1395,16 @@ class TrayMenu {
   /**
    * 销毁菜单句柄。重复调用是安全的（第二次为空操作）。
    *
-   * **destroy 之后菜单不可再被图标引用由 FFI 保证解除**：`uda_tray_menu_destroy`
-   * 会先把菜单从所有仍持有它的托盘图标上摘除、释放携带 C 函数指针的行闭包，
-   * 然后本方法才反注册 koffi 蹦床。顺序不能颠倒——koffi 的 unregister 会立即
-   * 释放回调槽位（总量上限 8192，释放后可能被后续注册复用），若图标仍持有菜单，
-   * 下一次点击就会调用已释放的槽位（use-after-free，表现为崩溃或误触发另一个
-   * JS 回调）。
+   * **destroy 之后菜单不可再被图标引用、旧行快照不再触达回调，由 FFI 保证**：
+   * `uda_tray_menu_destroy` 会先关闭菜单的回调门、再把菜单从所有仍持有它的
+   * 托盘图标上摘除，然后本方法才反注册 koffi 蹦床。顺序不能颠倒——koffi 的
+   * unregister 会立即释放回调槽位（总量上限 8192，释放后可能被后续注册复用），
+   * 若还有任何行快照可达，下一次点击就会调用已释放的槽位（use-after-free，
+   * 表现为崩溃或误触发另一个 JS 回调）。
+   *
+   * 若某个行回调正在执行，FFI 返回 `UDA_ERR_INTERNAL` 且菜单保持完整；此时
+   * `destroyed` 仍为 false、蹦床槽位全部保留，等回调返回后再次调用本方法重试
+   * 即可（等待在 JS 侧进行，不会阻塞托盘工作线程）。
    *
    * 手工验证"建菜单 → setMenu → destroy → 点击"场景（修复前必崩/误触发）：
    * 1. `cargo build -p uda-ffi` 后运行一段脚本：`uda.createTrayMenu()` →
@@ -1412,12 +1416,13 @@ class TrayMenu {
     if (this.destroyed) {
       return;
     }
-    this.destroyed = true;
-    // 先销毁句柄：FFI 侧把菜单从所有仍引用它的图标上解除，并释放持有 C 函数
-    // 指针的行闭包；此后不再有任何 C 代码能触达这些回调槽位。
+    // 先销毁句柄：FFI 侧关闭回调门、把菜单从所有仍引用它的图标上解除；
+    // 此后不再有任何 C 代码能触达这些回调槽位。失败（回调正在执行）时在
+    // 此抛出、destroyed 与 keepalives 原样保留——宁可保留槽位等待重试，
+    // 也不把可能仍被引用的指针释放掉。
     this.uda._check(this.uda._lib.trayMenuDestroy(this.handle), 'uda_tray_menu_destroy');
-    // 再反注册蹦床：槽位已无人可达，释放是安全的。destroy 失败时在此抛出、
-    // keepalives 原样保留——宁可泄漏槽位，也不把可能仍被引用的指针释放掉。
+    this.destroyed = true;
+    // 再反注册蹦床：槽位已无人可达，释放是安全的。
     for (const trampoline of this.keepalives) {
       try {
         this.uda._unregisterCallback(trampoline);

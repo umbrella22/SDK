@@ -285,15 +285,18 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 /// A set bit means a receiver for the action was reachable when the
 /// capabilities were queried; the attempt can still fail (hibernation
 /// switched off, polkit refusal) and then fails with `UDA_ERR_NOT_SUPPORTED`.
-/// On Linux the session-management bits additionally require the *calling*
-/// session to be resolvable: lock-session and logout speak to the caller's
-/// own logind session object, so a daemon that runs sessionless (or can only
-/// see other users' sessions, as on a systemd-enabled WSL2 host) answers
-/// with the power bits alone - unless a desktop session manager
-/// (GNOME/KDE/XFCE) is reachable on the session bus, which claims the logout
-/// pair on its own, as on a traditional X11 desktop. Windows reboot and
-/// shutdown can likewise fail at attempt time when the caller lacks the
-/// SeShutdownPrivilege.
+/// On Linux `LOCK` needs the ScreenSaver service or a resolvable logind
+/// `auto` session (the caller's session, with the user's display session as
+/// the fallback logind itself applies), while `LOGOUT` and
+/// `SESSION_MANAGEMENT` need the caller's *own* logind session - resolved
+/// with `GetSession("")`, which never falls back to a display session - or a
+/// GNOME/KDE/XFCE desktop logout manager whose bus name is owned or
+/// activatable. A daemon that runs sessionless (or can only see other users'
+/// sessions, as on a systemd-enabled WSL2 host) therefore answers with the
+/// power bits, plus `LOCK` when `auto` resolves. Discovery never activates a
+/// desktop manager; activation or policy can still refuse an attempted
+/// action. Windows reboot and shutdown can likewise fail at attempt time
+/// when the caller lacks the SeShutdownPrivilege.
 ///
 /// # Safety
 ///
@@ -987,11 +990,15 @@ pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> c_int
 /// Destroy a menu handle.
 ///
 /// The menu is detached from **every** tray icon that still shows it, so its
-/// rows and callbacks stop firing immediately; the icons themselves stay alive
-/// and simply have no menu afterwards. This makes destroying a menu handle safe
+/// rows and callbacks stop firing (a snapshot a backend already cloned stays
+/// silent instead of calling the host); the icons themselves stay alive and
+/// simply have no menu afterwards. This makes destroying a menu handle safe
 /// even when the host has already attached it. Terminal: the handle cannot be
 /// reused afterwards. Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not
-/// a live menu.
+/// a live menu, and `UDA_ERR_INTERNAL` while one of the menu's callbacks is
+/// still running - the menu stays fully intact then, so a host that waits for
+/// its own callback to return and retries will succeed; the host may free its
+/// callback trampolines only after this call reports success.
 #[no_mangle]
 pub extern "C" fn uda_tray_menu_destroy(menu_handle: u64) -> c_int {
     util::catch_boundary(|| tray::destroy_menu(menu_handle))

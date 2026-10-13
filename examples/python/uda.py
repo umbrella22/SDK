@@ -1589,16 +1589,20 @@ class TrayMenu:
 
         在 :meth:`TrayIcon.set_menu` 之后调用是安全的：图标持有自己的引用，
         托盘仍可正常工作。销毁后句柄不可再用。
+
+        若某个行回调正在执行，FFI 会返回错误且菜单保持完整——此时不得释放
+        任何 ctypes 回调；等回调返回后重试即可。只有成功后，本方法才清空
+        句柄并解除登记，此后旧行快照也不再触达 Python 蹦床。
         """
         if self._handle == 0:
             return
         handle = self._handle
+        status = self._uda._lib.uda_tray_menu_destroy(handle)
+        self._uda._check(status, f"uda_tray_menu_destroy({handle})")
+        # 成功：FFI 侧菜单已销毁且回调门已关闭，旧行快照不会再调用蹦床，
+        # 现在解除登记、释放 ctypes 引用才是安全的。
         self._handle = 0
-        try:
-            status = self._uda._lib.uda_tray_menu_destroy(handle)
-            self._uda._check(status, f"uda_tray_menu_destroy({handle})")
-        finally:
-            self._uda._unregister_tray_menu(self)
+        self._uda._unregister_tray_menu(self)
 
     def __enter__(self) -> "TrayMenu":
         return self

@@ -146,6 +146,10 @@ fn acquire_native(lock_type: WakeLockType, reason: &str) -> Result<WakeLockGuard
     #[cfg(target_os = "windows")]
     {
         let reason = reason.to_string();
+        // The Windows backend runs the request on its own owner thread that
+        // lives until release, so the bridge's ephemeral worker (present when
+        // an ambient tokio runtime exists) cannot take the request down with
+        // it when it is joined after this call returns.
         crate::notify::run_sync(async move {
             let manager = uda_platform_windows::wakelock::WindowsWakeLockManager::new();
             manager.acquire(lock_type, &reason).await
