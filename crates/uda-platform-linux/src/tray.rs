@@ -203,6 +203,15 @@ fn rgba_to_argb(source: &TrayIconSource) -> Option<Vec<(i32, i32, Vec<u8>)>> {
 /// The owning menu's identity is part of the key because two submenus are
 /// separate `TrayMenu`s whose core id counters both start at 1; keying on the
 /// core id alone would alias their rows.
+///
+/// Known narrow window, documented and accepted for v0.2.2: the address half
+/// of the key can in principle be recycled by the allocator after a menu is
+/// dropped and before a later sync prunes its entry, so an A->B->C menu
+/// replacement whose new menu happens to land on the old address (same-size
+/// allocation, same core ids) could resurrect a retired id. The worst case
+/// is a shell replaying one stale cached id against the rebuilt menu until
+/// the next layout broadcast; if that window ever matters in practice, a
+/// generation counter in the key is the remedy.
 #[derive(Debug)]
 struct MenuIdMap {
     /// `(owning menu, core MenuItemId)` -> dbusmenu id.

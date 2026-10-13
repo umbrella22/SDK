@@ -413,7 +413,7 @@ int32_t uda_media_send_command(int32_t command);
  * Report which session and power actions this platform can perform.
  *
  * Writes a bitmask made of the UDA_SESSION_CAP_* flags to `*out_capabilities`;
- * 0 means "no session backend exists on this target".
+ * 0 means "no receiver for any session action is reachable on this target".
  *
  * The query is side-effect-free - it never touches the machine's power state;
  * on Linux it answers from a one-shot, cached service probe - so a host may

@@ -65,7 +65,7 @@
 //!
 //! See `docs/internals/session_specs.md` for the full mapping.
 
-use std::process::Command;
+use std::process::Stdio;
 use std::sync::OnceLock;
 
 use uda_core::capability::Capability;
@@ -74,7 +74,7 @@ use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
 use crate::wakelock::{bus_unique_names, logind_present, screensaver_present};
-use crate::DBUS_TIMEOUT;
+use crate::{COMMAND_TIMEOUT, DBUS_TIMEOUT};
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
 
@@ -142,13 +142,10 @@ impl LinuxSessionManager {
     ///
     /// Synchronous on the outside (the trait is synchronous), asynchronous on
     /// the inside: the future is driven by `crate::sync::run_async`, which is
-    /// safe to call from inside a tokio runtime as well (P1-15).
-    fn login1_power(&self, method: &str) -> Result<(), UdaError> {
-        let method = method.to_string();
-        // The future takes ownership of `method`; `action` keeps the name for
-        // the bridge-failure message below.
-        let action = method.clone();
-
+    /// safe to call from inside a tokio runtime as well (P1-15). `method` is
+    /// `&'static str` so the name can travel into the future by copy instead of
+    /// an owned `String`, and stay available for the bridge-failure message.
+    fn login1_power(&self, method: &'static str) -> Result<(), UdaError> {
         crate::sync::run_async(async move {
             let connection = Self::system_connection().await?;
 
@@ -175,7 +172,7 @@ impl LinuxSessionManager {
             // so logind must not open its own confirmation dialog.
             match tokio::time::timeout(
                 DBUS_TIMEOUT,
-                proxy.call::<&str, (bool,), ()>(method.as_str(), &(false,)),
+                proxy.call::<&str, (bool,), ()>(method, &(false,)),
             )
             .await
             {
@@ -183,7 +180,7 @@ impl LinuxSessionManager {
                     log::debug!("logind accepted {method}");
                     Ok(())
                 }
-                Ok(Err(e)) => Err(map_login1_error(&method, &e.to_string())),
+                Ok(Err(e)) => Err(map_login1_error(method, &e.to_string())),
                 Err(_) => Err(not_delivered(format!(
                     "logind {method} timed out after {DBUS_TIMEOUT:?}"
                 ))),
@@ -193,7 +190,7 @@ impl LinuxSessionManager {
         // contract error like every other outcome.
         .map_err(|e| {
             not_delivered(format!(
-                "the logind {action} call could not be attempted: {e}"
+                "the logind {method} call could not be attempted: {e}"
             ))
         })?
     }
@@ -250,7 +247,30 @@ impl LinuxSessionManager {
     /// discovered. It is the tier that still works when the desktop runs no
     /// screen saver service at all.
     fn lock_via_loginctl(&self) -> Result<(), UdaError> {
-        let status = Command::new("loginctl").arg("lock-session").status();
+        // The spawn is bounded by `COMMAND_TIMEOUT` like every other CLI tier
+        // (P0-3): a wedged loginctl is killed and reported undelivered
+        // instead of pinning the caller forever.
+        let status = crate::sync::run_async(async {
+            let mut child = tokio::process::Command::new("loginctl")
+                .arg("lock-session")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(map_loginctl_spawn)?;
+
+            match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(e)) => Err(map_loginctl_spawn(e)),
+                Err(_) => {
+                    let _ = child.start_kill();
+                    Err(not_delivered(format!(
+                        "loginctl lock-session did not answer within {COMMAND_TIMEOUT:?}"
+                    )))
+                }
+            }
+        })
+        .map_err(|e| not_delivered(format!("the loginctl lock could not be attempted: {e}")))?;
 
         match status {
             Ok(status) if status.success() => {
@@ -258,7 +278,7 @@ impl LinuxSessionManager {
                 Ok(())
             }
             Ok(status) => Err(map_loginctl_exit(status.code())),
-            Err(e) => Err(map_loginctl_spawn(e)),
+            Err(e) => Err(e),
         }
     }
 
@@ -745,9 +765,8 @@ pub(crate) fn method_for(action: SessionAction) -> Option<&'static str> {
 
 /// Whether a logind error text means "not authorised".
 ///
-/// Split out from [`map_login1_error`] so the CLI tier and the D-Bus tier make
-/// the same distinction.
-#[allow(dead_code)] // shared classification helper, kept next to its only caller
+/// Split out from [`map_login1_error`] so the classification rule stays
+/// unit-testable without a bus.
 pub(crate) fn error_is_authorization(text: &str) -> bool {
     // `AccessDenied` is D-Bus's generic refusal and `NotAuthorized` is what
     // logind itself emits. `InteractiveAuthorizationRequired` is polkit's answer

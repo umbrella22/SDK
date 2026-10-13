@@ -24,8 +24,9 @@
 //! # Capability bitmask
 //!
 //! `session_capabilities` reports the flags the platform's backend
-//! advertises. `0` means "no session backend exists here", which is also what a
-//! non-Linux, non-Windows target answers.
+//! advertises. `0` means "no receiver for any session action is reachable
+//! here" - no backend, or a backend whose probes found nothing to talk to -
+//! which is also what a non-Linux, non-Windows target answers.
 
 use uda_core::capability::Capability;
 use uda_core::session::{SessionAction, SessionManager};

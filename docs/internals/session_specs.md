@@ -5,7 +5,8 @@
 入口；本文记录两端各自"怎么做到"，是唯一事实来源。
 
 > **安全前提**：六个动作里五个会结束用户会话或停止机器。本模块把
-> `capabilities()` 设计成**静态、无副作用**的查询，把六个动作设计成"返回
+> `capabilities()` 设计成**无副作用**的查询（Linux 上答案来自一次有界的
+> 服务探测，按进程缓存一次），把六个动作设计成"返回
 > `Ok` 的瞬间就已不可撤销"。只有 `Lock` 可以自动化，其余必须由宿主应用自己
 > 弹确认框。自动化测试**严禁**触发真实电源动作，见
 > §7 测试红线。
@@ -108,7 +109,8 @@ Hyprland/Sway 的 `swayidle`/`hypridle` 也导出它。Tier 3 回退是
 | KDE | `org.kde.Shutdown` | `/Shutdown` | `org.kde.Shutdown` | `logout` |
 | XFCE | `org.xfce.SessionManager` | `/org/xfce/SessionManager` | `org.xfce.Session.Manager` | `Logout(true, false)` |
 
-每次尝试都带超时；全部失败则返回最后一次的语义错误，绝不静默成功。
+每次尝试都带超时；桌面候选只回答成功与否（拒绝仅进调试日志），全部失败时
+返回 logind 层的语义错误，绝不静默成功。
 
 ### 2.4 错误映射（D-Bus）
 
@@ -119,13 +121,16 @@ Hyprland/Sway 的 `swayidle`/`hypridle` 也导出它。Tier 3 回退是
 | `InteractiveAuthorizationRequired` | `NotSupported` | polkit 规则要弹对话框，而 UDA 宿主通常不是已注册的 polkit subject，弹不出来；同样不是"再试一次"能解决的 |
 | `org.freedesktop.systemd1.NoSuchOperation` | `NotSupported` | 机器缺这个能力（最常见：没开 swap 时休眠） |
 | `...NotSupported...` | `NotSupported` | 同上 |
-| 连接 system bus 失败 / 超时 | `DetectionFailed` | 环境问题，不是功能缺失 |
-| 其它 | `CommandFailed` | 带原文透传，便于排查 |
+| 连接 system bus 失败 / 超时 | `NotSupported` | 探测不到的接收方等同"未送达"，与环境问题同一出口 |
+| `loginctl` 非零退出 / spawn 失败 | `NotSupported` | 诊断原文保留在消息里，便于排查 |
+| 其它 | `NotSupported` | 同上 |
 
 分类是**对已渲染错误文本**做的纯函数（`map_login1_error`），因此可在无 D-Bus
 的 CI 里单测，也不依赖某个版本的 zbus 如何格式化方法错误。`AccessDenied`
-归到 `NotSupported` 而非 `CommandFailed`：调用方需要能说"请找管理员授权"，
-而不是"再试一次"。
+归到 `NotSupported` 而非通用失败：调用方需要能说"请找管理员授权"，而不是
+"再试一次"；本模块**所有**"动作未能送达"的路径（连接、polkit 拒绝、
+`NoSuchOperation`、CLI 非零退出、spawn 失败）都收敛到 `NotSupported` 一条
+出口，`include/uda.h` 承诺的 `-2` 契约因此按构造成立。
 
 ## 3. Windows：Win32 会话与电源 API
 

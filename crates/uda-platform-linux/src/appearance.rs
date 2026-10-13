@@ -20,7 +20,7 @@ use crate::COMMAND_TIMEOUT;
 ///    - `org.gnome.desktop.interface gtk-theme`, trusted for `Light` only when
 ///      `dconf` shows the key was explicitly set (see
 ///      `parse_theme_from_gtk_theme`)
-/// 3. **KDE Plasma** (`kreadconfig5`):
+/// 3. **KDE Plasma** (`kreadconfig6`, falling back to `kreadconfig5`):
 ///    - `kdeglobals` -> `General` -> `ColorScheme`
 /// 4. **XFCE** (`xfconf-query`):
 ///    - xsettings `Net/ThemeName`, answered dark-or-unknown like KDE
@@ -273,22 +273,26 @@ impl LinuxAppearanceManager {
     /// same honesty rule as the GNOME fallback applies: a dark-named scheme is
     /// a positive Dark answer, and anything else is "cannot know" - guessing
     /// Light from an unconfirmed name is how a headless environment ends up
-    /// reporting a theme nobody configured. `kreadconfig5` without `--default`
+    /// reporting a theme nobody configured. `kreadconfig*` without `--default`
     /// already prints an empty string for a missing key, so unset keys arrive
     /// here as `None` via [`Self::run_command`].
     async fn detect_kde_theme() -> Option<Theme> {
-        let output = Self::run_command(
-            "kreadconfig5",
-            &[
-                "--file",
-                "kdeglobals",
-                "--group",
-                "General",
-                "--key",
-                "ColorScheme",
-            ],
-        )
-        .await;
+        // Plasma 6 ships only `kreadconfig6`, Plasma 5 only `kreadconfig5`;
+        // the two spellings take identical arguments, so try the current one
+        // first and let the other cover older installs.
+        const COLOR_SCHEME_ARGS: &[&str] = &[
+            "--file",
+            "kdeglobals",
+            "--group",
+            "General",
+            "--key",
+            "ColorScheme",
+        ];
+
+        let output = match Self::run_command("kreadconfig6", COLOR_SCHEME_ARGS).await {
+            Some(output) => Some(output),
+            None => Self::run_command("kreadconfig5", COLOR_SCHEME_ARGS).await,
+        };
 
         let value = output?;
         Self::theme_from_scheme_name(&value)
