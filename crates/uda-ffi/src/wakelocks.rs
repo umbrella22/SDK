@@ -59,6 +59,13 @@ use crate::error::Failure;
 /// `uda_last_error_message()` when the tier is used.
 const CLI_LOCK_SECONDS: u64 = 3600;
 
+/// Bound authorization and startup before exposing a CLI lock handle.
+const CLI_START_TIMEOUT: Duration = Duration::from_secs(10);
+
+// systemd-inhibit starts this command only after acquiring its inhibition FD.
+// The shell acknowledges that boundary, then becomes the bounded lock holder.
+const CLI_HOLDER: &str = "printf R; exec sleep \"$1\"";
+
 /// How a live entry must be released.
 enum LockEntry {
     /// A native guard whose `Drop` performs the release.
@@ -183,21 +190,20 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
     #[cfg(target_os = "linux")]
     verify_someone_receives_the_lock()?;
 
-    let child = Command::new("systemd-inhibit")
-        .arg("--who=UDA")
-        .arg(format!("--why={reason}"))
-        .arg(format!("--what={}", cli_what_flag(lock_type)))
-        .arg("--mode=block")
-        .arg("sleep")
-        .arg(CLI_LOCK_SECONDS.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            Failure::Uda(UdaError::NotSupported(format!(
-                "no native wake lock and the systemd-inhibit CLI fallback is unavailable: {error}"
-            )))
-        })?;
+    let child = spawn_cli_holder(
+        Command::new("systemd-inhibit")
+            .arg("--who=UDA")
+            .arg(format!("--why={reason}"))
+            .arg(format!("--what={}", cli_what_flag(lock_type)))
+            .arg("--mode=block")
+            .arg("--no-ask-password")
+            .arg("sh")
+            .arg("-c")
+            .arg(CLI_HOLDER)
+            .arg("uda-inhibit")
+            .arg(CLI_LOCK_SECONDS.to_string()),
+        CLI_START_TIMEOUT,
+    )?;
 
     log::debug!(
         "acquired CLI wake lock {lock_type:?} ({reason}) via systemd-inhibit for {CLI_LOCK_SECONDS}s"
@@ -208,6 +214,54 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
         expires_at: Instant::now() + Duration::from_secs(CLI_LOCK_SECONDS),
     };
     register(next_valid_handle()?, entry)
+}
+
+/// Wait for the wrapped command to acknowledge that Inhibit succeeded.
+/// A socket deadline bounds the wait without leaving a reader thread behind.
+fn spawn_cli_holder(command: &mut Command, timeout: Duration) -> Result<Child, Failure> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::process::Stdio;
+
+        let failure = |error| {
+            Failure::Uda(UdaError::NotSupported(format!(
+                "systemd-inhibit did not confirm acquiring the wake lock: {error}"
+            )))
+        };
+        let (mut ready, writer) = UnixStream::pair().map_err(failure)?;
+        ready.set_read_timeout(Some(timeout)).map_err(failure)?;
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(OwnedFd::from(writer)))
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(failure)?;
+        // Command retains its copy of stdout after spawn; close it so an
+        // early child exit produces EOF rather than waiting for the timeout.
+        command.stdout(Stdio::null());
+        let mut marker = [0];
+        match ready.read_exact(&mut marker) {
+            Ok(()) if marker == *b"R" => Ok(child),
+            outcome => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let error = outcome.err().unwrap_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid readiness reply")
+                });
+                Err(failure(error))
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (command, timeout);
+        Err(Failure::Uda(UdaError::NotSupported(
+            "the systemd-inhibit fallback requires Linux".to_string(),
+        )))
+    }
 }
 
 /// Verify that somebody will actually receive the CLI tier's inhibit lock.
@@ -435,6 +489,36 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("`sleep` exists on the unix hosts this crate is tested on")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_startup_requires_a_readiness_reply() {
+        for script in ["exit 1", "printf X", "exec sleep 30"] {
+            let started = Instant::now();
+            let result = spawn_cli_holder(
+                Command::new("sh").args(["-c", script]),
+                Duration::from_millis(100),
+            );
+            assert!(
+                matches!(result, Err(Failure::Uda(UdaError::NotSupported(_)))),
+                "a refusal, invalid reply or timeout must not produce a lock: {result:?}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cli_holder_acknowledges_then_stays_alive_until_released() {
+        let mut child = spawn_cli_holder(
+            Command::new("sh").args(["-c", CLI_HOLDER, "uda-inhibit", "30"]),
+            Duration::from_secs(5),
+        )
+        .expect("the holder acknowledges startup");
+        assert!(child.try_wait().expect("child status").is_none());
+        kill_and_reap(0, &mut child, "test release");
+        assert!(child.try_wait().expect("reaped child status").is_some());
     }
 
     #[test]

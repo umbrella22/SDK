@@ -1589,12 +1589,18 @@ impl Worker {
     /// # Safety
     /// `worker` points at the pinned owner on this thread.
     unsafe fn show_menu(worker: *mut Self, anchor: MenuAnchor) {
-        // SAFETY: `prepare_menu` releases every borrow before tracking starts,
-        // and the tracking guard is an owned `Arc<AtomicBool>`.
+        // Claim the per-worker guard before preparation starts. `SetForegroundWindow`
+        // can synchronously activate this window and re-enter the procedure, so
+        // the guard must cover that call as well as `TrackPopupMenuEx`; otherwise
+        // a nested menu can rebuild the one shared command table underneath the
+        // outer popup.
+        let guard = unsafe { (*worker).menu_tracking.clone() };
+        let Some(_tracking) = MenuTrackingGuard::try_enter(guard) else {
+            log::debug!("menu trigger ignored while a popup is being prepared or tracked");
+            return;
+        };
         if let Some(session) = unsafe { Self::prepare_menu(worker, anchor) } {
-            // SAFETY: short field read producing an owned guard clone.
-            let guard = unsafe { (*worker).menu_tracking.clone() };
-            session.track(guard);
+            session.track();
         }
     }
 
@@ -1852,6 +1858,25 @@ impl Worker {
     }
 }
 
+/// Own the per-worker exclusion flag across preparation and modal tracking.
+struct MenuTrackingGuard(Arc<AtomicBool>);
+
+impl MenuTrackingGuard {
+    fn try_enter(flag: Arc<AtomicBool>) -> Option<Self> {
+        if flag.swap(true, Ordering::AcqRel) {
+            None
+        } else {
+            Some(Self(flag))
+        }
+    }
+}
+
+impl Drop for MenuTrackingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// The modal phase of a context menu: plain values only, no worker borrow.
 ///
 /// A standalone bundle on purpose, so the modal loop inside `TrackPopupMenuEx`
@@ -1875,15 +1900,10 @@ impl MenuSession {
     /// logged as an error — the choice is then lost, which is strictly worse
     /// than a failed menu build.
     ///
-    /// The tracking guard is an owned `Arc<AtomicBool>`: the window procedure
-    /// re-entered by the modal loop reads the same guard through the worker's
-    /// pinned pointer, so no borrow of the worker survives into `TrackPopupMenuEx`.
-    fn track(self, menu_tracking: Arc<AtomicBool>) {
-        // The window procedure ignores further menu triggers while this is
-        // set; the nested trigger sees it before any pumping starts and the
-        // flag never has to be process-wide.
-        menu_tracking.store(true, Ordering::Release);
-
+    /// `Worker::show_menu` owns the tracking guard. The window procedure
+    /// re-entered by the modal loop reads the flag through the worker's pinned
+    /// pointer, so no borrow of the worker survives into `TrackPopupMenuEx`.
+    fn track(self) {
         // SAFETY: `popup` is live, `hwnd` is live, and no `TPMPARAMS` is needed
         // for a simple popup. `TPM_RETURNCMD` hands the chosen id back instead
         // of posting `WM_COMMAND`, which keeps the lookup in one place.
@@ -1903,10 +1923,6 @@ impl MenuSession {
         unsafe {
             let _ = PostMessageW(self.hwnd, WM_NULL, WPARAM(0), LPARAM(0));
         }
-
-        // The modal loop is done; release the guard before any later message
-        // could legitimately be treated as a menu request again.
-        menu_tracking.store(false, Ordering::Release);
 
         // `popup` is no longer referenced by the shell once `TrackPopupMenuEx`
         // returned.
@@ -2266,6 +2282,36 @@ impl TrayManager for WindowsTrayManager {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn menu_tracking_excludes_reentry_until_the_owner_exits() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let guard = MenuTrackingGuard::try_enter(Arc::clone(&flag))
+            .expect("the first menu owns the preparation and tracking interval");
+        assert!(flag.load(Ordering::Acquire));
+        assert!(MenuTrackingGuard::try_enter(Arc::clone(&flag)).is_none());
+        assert!(
+            flag.load(Ordering::Acquire),
+            "a rejected entry must not clear the owner"
+        );
+        drop(guard);
+        assert!(!flag.load(Ordering::Acquire));
+        assert!(MenuTrackingGuard::try_enter(Arc::clone(&flag)).is_some());
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn failed_menu_preparation_releases_the_tracking_guard() {
+        fn prepare(flag: Arc<AtomicBool>) -> Option<()> {
+            let _guard = MenuTrackingGuard::try_enter(flag)?;
+            None
+        }
+
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(prepare(Arc::clone(&flag)).is_none());
+        assert!(!flag.load(Ordering::Acquire));
+        assert!(MenuTrackingGuard::try_enter(flag).is_some());
+    }
 
     /// Encode and read back a NUL-terminated UTF-16 string.
     fn round_trip(text: &str) -> String {

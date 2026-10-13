@@ -30,46 +30,29 @@ impl LinuxWakeLockManager {
         })
     }
 
-    /// The capability set this backend can honestly offer right now.
+    /// The native backend's capability set, cached after the first probe.
     ///
-    /// `WAKE_LOCK` is claimed only when a receiver that will actually honour a
-    /// lock is reachable: the native ScreenSaver service on the session bus,
-    /// or systemd-logind on the system bus (which the CLI tier's
-    /// `systemd-inhibit` locks are received by). The probe result is cached
-    /// per process, exactly like the appearance backend's accent-colour probe;
-    /// a receiver does not get installed mid-session, and the query may sit on
-    /// hot paths.
+    /// `WAKE_LOCK` requires the ScreenSaver service this manager calls.
+    /// The FFI layer's separate logind CLI fallback is not part of this manager.
     pub fn capabilities(&self) -> Capability {
         wake_lock_support(Self::reachability()).0
     }
 
-    /// How well wake locks work right now, with the reason when degraded.
-    ///
-    /// `Full` when the native ScreenSaver protocol answers on the session bus;
-    /// `Partial` with the reason when only logind is there; `None` when neither
-    /// is reachable, matching an empty [`Self::capabilities`].
-    ///
-    /// The `Partial` tier is honest about the whole UDA stack, not just this
-    /// crate: this manager's own [`Self::acquire`] only speaks ScreenSaver -
-    /// the `systemd-inhibit` CLI tier the reason points at is wired up one
-    /// layer higher, in `uda-ffi`'s wake-lock registry. Rust hosts that call
-    /// this manager directly get the ScreenSaver path only.
+    /// `Partial` when ScreenSaver is reachable: display-idle inhibition is
+    /// supported, but the protocol cannot request system-suspend inhibition.
+    /// `None` means this manager has no receiver for either lock type.
     pub fn support_level(&self) -> SupportLevel {
         wake_lock_support(Self::reachability()).1
     }
 
-    /// Which wake-lock receivers are reachable, probed once per process.
+    /// Whether the native wake-lock receiver is reachable, probed once per process.
     ///
     /// A probe error caches as "absent": a receiver that cannot be reached
     /// cannot be claimed either, the same collapse
     /// `LinuxAppearanceManager::accent_color_key_available` applies.
-    fn reachability() -> (bool, bool) {
-        static REACHABLE: OnceLock<(bool, bool)> = OnceLock::new();
-        *REACHABLE.get_or_init(|| {
-            let screensaver = probe_or_absent(crate::sync::run_async(screensaver_present()));
-            let logind = probe_or_absent(crate::sync::run_async(logind_present()));
-            (screensaver, logind)
-        })
+    fn reachability() -> bool {
+        static REACHABLE: OnceLock<bool> = OnceLock::new();
+        *REACHABLE.get_or_init(|| probe_or_absent(crate::sync::run_async(screensaver_present())))
     }
 }
 
@@ -169,22 +152,15 @@ fn probe_or_absent(probe: Result<Result<bool, UdaError>, UdaError>) -> bool {
 
 /// Turn probe answers into the honest capability bit and support level.
 ///
-/// Pure so the whole matrix is testable without a bus. Both receivers
-/// reachable - or the native one alone - is `Full`: the session-bus protocol
-/// is the designed path. Only logind is `Partial`, because acquisition then
-/// rides the CLI tier, whose locks are bounded rather than indefinite. With
-/// neither reachable, nothing is claimed at all.
-fn wake_lock_support(reachability: (bool, bool)) -> (Capability, SupportLevel) {
-    let (screensaver, logind) = reachability;
+/// ScreenSaver exposes display-idle inhibition only. A logind service does not
+/// add a capability to this manager because its `acquire` never calls logind.
+fn wake_lock_support(screensaver: bool) -> (Capability, SupportLevel) {
     if screensaver {
-        return (Capability::WAKE_LOCK, SupportLevel::Full);
-    }
-    if logind {
         return (
             Capability::WAKE_LOCK,
             SupportLevel::Partial(
-                "only the systemd-inhibit CLI tier is reachable: systemd-logind honours the \
-                 lock, but each lock is bounded to the CLI tier's lifetime rather than indefinite"
+                "ScreenSaver supports display-idle inhibition only; system-suspend \
+                 inhibition is not supported by this native backend"
                     .to_string(),
             ),
         );
@@ -212,6 +188,12 @@ impl WakeLockManager for LinuxWakeLockManager {
         lock_type: WakeLockType,
         reason: &str,
     ) -> Result<WakeLockGuard, UdaError> {
+        if lock_type == WakeLockType::PreventSystemIdle {
+            return Err(UdaError::NotSupported(
+                "ScreenSaver cannot request system-suspend inhibition".to_string(),
+            ));
+        }
+
         let proxy = internal_dbus(
             "building the ScreenSaver proxy",
             zbus::Proxy::new(
@@ -223,10 +205,9 @@ impl WakeLockManager for LinuxWakeLockManager {
         )
         .await?;
 
-        let flags = lock_type.to_screen_saver_flags();
         let cookie: u32 = internal_dbus(
             "the Inhibit call",
-            proxy.call("Inhibit", &(env!("CARGO_PKG_NAME"), reason, flags)),
+            proxy.call("Inhibit", &(env!("CARGO_PKG_NAME"), reason)),
         )
         .await?;
 
@@ -284,6 +265,126 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    struct IsolatedBus {
+        child: std::process::Child,
+        directory: std::path::PathBuf,
+    }
+
+    impl Drop for IsolatedBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[derive(Default)]
+    struct ScreenSaverCalls {
+        inhibit: std::sync::Mutex<Vec<(String, String)>>,
+        uninhibit: std::sync::Mutex<Vec<u32>>,
+        released: tokio::sync::Notify,
+    }
+
+    struct MockScreenSaver(Arc<ScreenSaverCalls>);
+
+    #[zbus::interface(name = "org.freedesktop.ScreenSaver")]
+    impl MockScreenSaver {
+        // The real protocol accepts precisely two strings, without flags.
+        fn inhibit(&self, app_name: &str, reason: &str) -> zbus::fdo::Result<u32> {
+            self.0
+                .inhibit
+                .lock()
+                .map_err(|_| zbus::fdo::Error::Failed("calls lock poisoned".to_string()))?
+                .push((app_name.to_string(), reason.to_string()));
+            Ok(42)
+        }
+
+        fn un_inhibit(&self, cookie: u32) -> zbus::fdo::Result<()> {
+            self.0
+                .uninhibit
+                .lock()
+                .map_err(|_| zbus::fdo::Error::Failed("calls lock poisoned".to_string()))?
+                .push(cookie);
+            self.0.released.notify_one();
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn native_acquisition_obeys_the_screen_saver_protocol(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::io::BufRead as _;
+        use std::process::Stdio;
+
+        // Explicit addresses keep the fixture away from the host's real buses.
+        let directory =
+            std::env::temp_dir().join(format!("uda-wakelock-mock-{}", std::process::id()));
+        std::fs::create_dir(&directory)?;
+        let config = directory.join("bus.conf");
+        std::fs::write(
+            &config,
+            format!(
+                "<busconfig><type>session</type><listen>unix:tmpdir={}</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow send_destination=\"*\"/><allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>",
+                directory.display()
+            ),
+        )?;
+        let mut bus = IsolatedBus {
+            child: std::process::Command::new("dbus-daemon")
+                .args(["--nofork", "--print-address=1"])
+                .arg(format!("--config-file={}", config.display()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()?,
+            directory,
+        };
+        let stdout = bus.child.stdout.take().ok_or("missing bus address pipe")?;
+        let mut address = String::new();
+        std::io::BufReader::new(stdout).read_line(&mut address)?;
+        let address = address.trim();
+        let calls = Arc::new(ScreenSaverCalls::default());
+        let _server = zbus::connection::Builder::address(address)?
+            .name(SCREEN_SAVER_SERVICE)?
+            .serve_at(SCREEN_SAVER_PATH, MockScreenSaver(Arc::clone(&calls)))?
+            .build()
+            .await?;
+        let manager = LinuxWakeLockManager {
+            connection: Arc::new(zbus::connection::Builder::address(address)?.build().await?),
+        };
+
+        assert!(matches!(
+            manager
+                .acquire(WakeLockType::PreventSystemIdle, "system sleep")
+                .await,
+            Err(UdaError::NotSupported(_))
+        ));
+        assert!(calls
+            .inhibit
+            .lock()
+            .map_err(|_| "calls lock poisoned")?
+            .is_empty());
+
+        let guard = manager
+            .acquire(WakeLockType::PreventDisplaySleep, "playing a movie")
+            .await?;
+        assert_eq!(
+            *calls.inhibit.lock().map_err(|_| "calls lock poisoned")?,
+            vec![(
+                env!("CARGO_PKG_NAME").to_string(),
+                "playing a movie".to_string()
+            )]
+        );
+        // Release joins a blocking cleanup worker; keep this runtime polling
+        // the mock service until its UnInhibit reply has been delivered.
+        tokio::task::spawn_blocking(move || guard.release()).await?;
+        tokio::time::timeout(crate::DBUS_TIMEOUT, calls.released.notified()).await?;
+        assert_eq!(
+            *calls.uninhibit.lock().map_err(|_| "calls lock poisoned")?,
+            vec![42]
+        );
+        Ok(())
+    }
+
     #[test]
     fn guard_runs_release_on_drop() {
         let released = Arc::new(AtomicBool::new(false));
@@ -304,12 +405,6 @@ mod tests {
         }));
         guard.release();
         assert!(released.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn wake_lock_type_flags() {
-        assert_eq!(WakeLockType::PreventDisplaySleep.to_screen_saver_flags(), 8);
-        assert_eq!(WakeLockType::PreventSystemIdle.to_screen_saver_flags(), 12);
     }
 
     #[test]
@@ -344,24 +439,12 @@ mod tests {
     }
 
     #[test]
-    fn the_capability_matrix_claims_wake_lock_whenever_a_receiver_answers() {
-        // Native tier reachable: Full, with or without the CLI tier behind it.
-        let (caps, level) = wake_lock_support((true, false));
-        assert_eq!(caps, Capability::WAKE_LOCK);
-        assert_eq!(level, SupportLevel::Full);
-
-        let (caps, level) = wake_lock_support((true, true));
-        assert_eq!(caps, Capability::WAKE_LOCK);
-        assert_eq!(level, SupportLevel::Full);
-    }
-
-    #[test]
-    fn logind_only_degrades_to_partial_with_a_reason() {
-        let (caps, level) = wake_lock_support((false, true));
+    fn screen_saver_support_is_partial_with_a_reason() {
+        let (caps, level) = wake_lock_support(true);
         assert_eq!(caps, Capability::WAKE_LOCK);
         let reason = match &level {
             SupportLevel::Partial(reason) => reason.as_str(),
-            _ => panic!("logind-only reachability must degrade to Partial, got {level:?}"),
+            _ => panic!("ScreenSaver reachability must degrade to Partial, got {level:?}"),
         };
         assert!(
             !reason.is_empty(),
@@ -372,7 +455,7 @@ mod tests {
 
     #[test]
     fn no_receiver_claims_nothing() {
-        let (caps, level) = wake_lock_support((false, false));
+        let (caps, level) = wake_lock_support(false);
         assert!(caps.is_empty(), "no receiver, no claimed capability");
         assert_eq!(level, SupportLevel::None);
     }
