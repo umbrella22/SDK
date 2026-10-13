@@ -20,8 +20,8 @@
 | `SessionAction::Hibernate` | `org.freedesktop.login1.Manager.Hibernate(false)` | `powrprof!SetSuspendState(true, false, false)` |
 | `SessionAction::Reboot` | `org.freedesktop.login1.Manager.Reboot(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_REBOOT \| EWX_FORCEIFHUNG, 0)` |
 | `SessionAction::Shutdown` | `org.freedesktop.login1.Manager.PowerOff(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_POWEROFF \| EWX_FORCEIFHUNG, 0)` |
-| `Capability::SESSION_MANAGEMENT` | 探测到 `org.freedesktop.login1` 可达 | Win32 会话/电源 API 存在 |
-| `Capability::LOCK` / `LOGOUT` / ... | 探测到对应接收方可达 | Win32 API 存在 |
+| `Capability::SESSION_MANAGEMENT` | logind 调用者会话可解析，或桌面会话管理器可达（判据见第 5 节） | Win32 会话/电源 API 存在 |
+| `Capability::LOCK` / `LOGOUT` / ... | 探测到对应接收方可达（逐位判据见第 5 节） | Win32 API 存在 |
 
 ### 1.1 能力位（ABI 稳定）
 

@@ -111,30 +111,39 @@ pub(crate) async fn screensaver_present() -> Result<bool, UdaError> {
     .await
 }
 
-/// Whether `service` is currently owned on `connection`.
+/// The unique names currently owned on `connection`, from one listing.
 ///
 /// `DBusProxy::list_names` resolves to the fdo error type rather than
 /// `zbus::Error`, so that one call cannot go through
 /// [`crate::internal_dbus`]; it gets its own `DBUS_TIMEOUT` and the same
-/// mapping instead. The name-matching semantics are pinned by the tests below.
-/// Shared with the session backend's capability matrix, which re-dials it for
-/// the desktop logout managers on the same connection.
+/// mapping instead. Callers that check several services on one bus (the
+/// session backend's logout candidates) share this single round trip;
+/// [`bus_has_service`] is the one-name convenience wrapper.
+pub(crate) async fn bus_unique_names(
+    connection: &Connection,
+    step: &str,
+) -> Result<Vec<String>, UdaError> {
+    let proxy = internal_dbus(step, zbus::fdo::DBusProxy::new(connection)).await?;
+    match tokio::time::timeout(crate::DBUS_TIMEOUT, proxy.list_names()).await {
+        Ok(Ok(names)) => Ok(names.iter().map(|name| name.as_str().to_string()).collect()),
+        Ok(Err(e)) => Err(UdaError::Internal(format!("listing bus names failed: {e}"))),
+        Err(_) => Err(UdaError::Internal(format!(
+            "listing bus names timed out after {:?}",
+            crate::DBUS_TIMEOUT
+        ))),
+    }
+}
+
+/// Whether `service` is currently owned on `connection`.
+///
+/// One [`bus_unique_names`] round trip plus an exact-name match; the
+/// name-matching semantics are pinned by the tests below.
 pub(crate) async fn bus_has_service(
     connection: &Connection,
     step: &str,
     service: &str,
 ) -> Result<bool, UdaError> {
-    let proxy = internal_dbus(step, zbus::fdo::DBusProxy::new(connection)).await?;
-    let names = match tokio::time::timeout(crate::DBUS_TIMEOUT, proxy.list_names()).await {
-        Ok(Ok(names)) => names,
-        Ok(Err(e)) => return Err(UdaError::Internal(format!("listing bus names failed: {e}"))),
-        Err(_) => {
-            return Err(UdaError::Internal(format!(
-                "listing bus names timed out after {:?}",
-                crate::DBUS_TIMEOUT
-            )))
-        }
-    };
+    let names = bus_unique_names(connection, step).await?;
     Ok(bus_names_contain(
         names.iter().map(|name| name.as_str()),
         service,

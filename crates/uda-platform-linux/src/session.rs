@@ -73,7 +73,7 @@ use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
-use crate::wakelock::{bus_has_service, logind_present, screensaver_present};
+use crate::wakelock::{bus_unique_names, logind_present, screensaver_present};
 use crate::DBUS_TIMEOUT;
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
@@ -611,24 +611,18 @@ async fn logind_session_present() -> Result<bool, UdaError> {
 /// logind cannot resolve a caller session: a traditional X11 desktop that
 /// predates seat attribution has exactly such a manager and no logind
 /// session. The probe re-dials the same well-known services the fallback
-/// dials, through the shared [`bus_has_service`]; only name ownership is
-/// checked, since a wire-level refusal stays attempt-time territory (polkit,
-/// desktop policy). Bounded by [`DBUS_TIMEOUT`] per candidate and folding to
-/// "absent" like every other probe.
+/// dials; only name ownership is checked, since a wire-level refusal stays
+/// attempt-time territory (polkit, desktop policy). One
+/// [`bus_unique_names`] listing covers all three candidates - the fallback
+/// tries them one by one, but name ownership does not need a round trip
+/// apiece. Bounded by [`DBUS_TIMEOUT`] and folding to "absent" like every
+/// other probe.
 async fn desktop_logout_manager_present() -> Result<bool, UdaError> {
     let connection = LinuxSessionManager::session_connection().await?;
-    for candidate in LOGOUT_CANDIDATES {
-        if bus_has_service(
-            &connection,
-            "building the session bus daemon proxy",
-            candidate.service,
-        )
-        .await?
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    let names = bus_unique_names(&connection, "building the session bus daemon proxy").await?;
+    Ok(LOGOUT_CANDIDATES
+        .iter()
+        .any(|candidate| names.iter().any(|name| name.as_str() == candidate.service)))
 }
 
 /// Collapse a bridged probe into a plain bool.
