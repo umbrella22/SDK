@@ -62,9 +62,9 @@ fi
 
 installed="$(cbindgen --version | awk '{print $2}')"
 if [ "$installed" != "$CBINDGEN_VERSION" ]; then
-    echo "warning: cbindgen v${installed} installed, but the header is generated" >&2
-    echo "         with v${CBINDGEN_VERSION}; output can differ between versions." >&2
-    echo "         Consider: cargo install cbindgen --locked --version ${CBINDGEN_VERSION}" >&2
+    echo "error: cbindgen v${installed} installed; header generation requires v${CBINDGEN_VERSION}." >&2
+    echo "       Run: cargo install cbindgen --locked --version ${CBINDGEN_VERSION}" >&2
+    exit 1
 fi
 
 # Keep the scratch file inside the workspace (`.tmp/` is gitignored): a

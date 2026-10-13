@@ -199,37 +199,37 @@
  * This bit says nothing by itself: it only means at least one of the six
  * actions below is reachable. Test the action's own bit before offering it.
  */
-#define UDA_SESSION_CAP_MANAGEMENT (1 << 16)
+#define UDA_SESSION_CAP_MANAGEMENT (1u << 16)
 
 /**
  * The session can be locked - the only action safe to automate.
  */
-#define UDA_SESSION_CAP_LOCK (1 << 17)
+#define UDA_SESSION_CAP_LOCK (1u << 17)
 
 /**
  * The calling user's session can be ended.
  */
-#define UDA_SESSION_CAP_LOGOUT (1 << 18)
+#define UDA_SESSION_CAP_LOGOUT (1u << 18)
 
 /**
  * The machine can be suspended to RAM.
  */
-#define UDA_SESSION_CAP_SUSPEND (1 << 19)
+#define UDA_SESSION_CAP_SUSPEND (1u << 19)
 
 /**
  * The machine can be hibernated to disk.
  */
-#define UDA_SESSION_CAP_HIBERNATE (1 << 20)
+#define UDA_SESSION_CAP_HIBERNATE (1u << 20)
 
 /**
  * The machine can be rebooted.
  */
-#define UDA_SESSION_CAP_REBOOT (1 << 21)
+#define UDA_SESSION_CAP_REBOOT (1u << 21)
 
 /**
  * The machine can be powered off.
  */
-#define UDA_SESSION_CAP_SHUTDOWN (1 << 22)
+#define UDA_SESSION_CAP_SHUTDOWN (1u << 22)
 
 /**
  * Callback type for a plain text menu row, or NULL for a silent row.

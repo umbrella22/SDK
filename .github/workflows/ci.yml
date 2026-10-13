@@ -118,6 +118,14 @@ jobs:
       - name: Test uda-ffi (C-ABI)
         run: cargo test --locked -p uda-ffi
 
+      # The generated header's numeric/typing contract (unsigned capability
+      # bits, no `UdaStatus` leaking into C) and the gen-header version gate,
+      # as C static asserts plus a stubbed-cbindgen run. Local regression
+      # script kept in CI so the guarantees never depend on someone running
+      # it by hand.
+      - name: Check the header's C-level contract
+        run: python3 -B scripts/test-header.py
+
       - name: Build FFI shared library
         run: cargo build --locked -p uda-ffi
 

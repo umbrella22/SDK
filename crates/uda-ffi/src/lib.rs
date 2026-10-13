@@ -52,7 +52,7 @@ use std::os::raw::{c_char, c_void};
 use uda_core::session::SessionAction;
 
 pub use abi::*;
-pub use error::status_message;
+pub use error::{status_message, UdaStatus};
 
 /// Detect the current system colour scheme.
 ///

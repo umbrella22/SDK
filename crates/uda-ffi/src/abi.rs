@@ -104,19 +104,19 @@ pub const UDA_MEDIA_CMD_STOP: i32 = 5;
 ///
 /// This bit says nothing by itself: it only means at least one of the six
 /// actions below is reachable. Test the action's own bit before offering it.
-pub const UDA_SESSION_CAP_MANAGEMENT: u32 = 1 << 16;
+pub const UDA_SESSION_CAP_MANAGEMENT: u32 = 1u32 << 16;
 /// The session can be locked - the only action safe to automate.
-pub const UDA_SESSION_CAP_LOCK: u32 = 1 << 17;
+pub const UDA_SESSION_CAP_LOCK: u32 = 1u32 << 17;
 /// The calling user's session can be ended.
-pub const UDA_SESSION_CAP_LOGOUT: u32 = 1 << 18;
+pub const UDA_SESSION_CAP_LOGOUT: u32 = 1u32 << 18;
 /// The machine can be suspended to RAM.
-pub const UDA_SESSION_CAP_SUSPEND: u32 = 1 << 19;
+pub const UDA_SESSION_CAP_SUSPEND: u32 = 1u32 << 19;
 /// The machine can be hibernated to disk.
-pub const UDA_SESSION_CAP_HIBERNATE: u32 = 1 << 20;
+pub const UDA_SESSION_CAP_HIBERNATE: u32 = 1u32 << 20;
 /// The machine can be rebooted.
-pub const UDA_SESSION_CAP_REBOOT: u32 = 1 << 21;
+pub const UDA_SESSION_CAP_REBOOT: u32 = 1u32 << 21;
 /// The machine can be powered off.
-pub const UDA_SESSION_CAP_SHUTDOWN: u32 = 1 << 22;
+pub const UDA_SESSION_CAP_SHUTDOWN: u32 = 1u32 << 22;
 
 // ---------------------------------------------------------------------------
 // Tray callbacks
