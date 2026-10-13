@@ -24,8 +24,10 @@
 //! the normal case for a player that publishes only a title.
 //!
 //! A machine with nobody to command reports
-//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED); any other
-//! non-`UDA_OK` status means the command was not delivered.
+//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED). Any
+//! non-`UDA_OK` status means success was not confirmed. After a timeout or
+//! communication failure, the player may already have executed the command;
+//! do not blindly retry commands such as Next or Toggle, which can act twice.
 
 use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
 

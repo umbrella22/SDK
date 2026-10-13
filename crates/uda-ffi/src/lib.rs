@@ -372,29 +372,18 @@ pub unsafe extern "C" fn uda_media_get_metadata(
     }
 
     util::catch_boundary(|| {
-        let metadata = media::active_metadata()?;
+        let metadata = media::active_metadata()?.unwrap_or_default();
 
         // The documented empty answer: an unpublished field is NULL rather
         // than an empty C string, "no player" (which the backends already
         // normalize into `None`) is NULL everywhere, and a zero duration
         // means "unknown" - all with a UDA_OK status, so a now-playing card
         // renders as empty instead of as a failure.
-        let (title, artist, album, duration_ms, position_ms) = match metadata {
-            Some(ref metadata) => (
-                c_string_or_null(metadata.title.as_deref()),
-                c_string_or_null(metadata.artist.as_deref()),
-                c_string_or_null(metadata.album.as_deref()),
-                metadata.duration_ms.unwrap_or(0),
-                metadata.position_ms.unwrap_or(0),
-            ),
-            None => (
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-                0,
-            ),
-        };
+        let title = c_string_or_null(metadata.title.as_deref());
+        let artist = c_string_or_null(metadata.artist.as_deref());
+        let album = c_string_or_null(metadata.album.as_deref());
+        let duration_ms = metadata.duration_ms.unwrap_or(0);
+        let position_ms = metadata.position_ms.unwrap_or(0);
 
         // SAFETY: all four pointers were validated non-null and writable above;
         // `out_position_ms` is checked before the optional write.
@@ -445,9 +434,10 @@ pub unsafe extern "C" fn uda_media_get_status(out_status: *mut i32) -> i32 {
 /// `UDA_MEDIA_CMD_STOP`. An unrecognised code returns
 /// `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
 ///
-/// A machine with no player running reports `UDA_ERR_NOT_SUPPORTED`, and any
-/// non-`UDA_OK` status means the command was not delivered, so a caller can
-/// tell "not delivered" from "delivered" without inspecting the player.
+/// A machine with no player running reports `UDA_ERR_NOT_SUPPORTED`. Any
+/// non-`UDA_OK` status means success was not confirmed. After a timeout or
+/// communication failure, the player may already have executed the command;
+/// do not blindly retry commands such as Next or Toggle, which can act twice.
 ///
 /// # Safety
 ///
