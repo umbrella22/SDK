@@ -389,8 +389,8 @@ fn dict_get<'d>(
 /// dictionary keys arrive as variants and the lookup must not fail the whole
 /// parse when one key is absent.
 pub(crate) fn metadata_from_dict(dictionary: &zbus::zvariant::Dict<'_, '_>) -> MediaMetadata {
-    // `dict_get` hands back an owned `Value`; the field readers deref-friendly
-    // signatures accept it directly, so no explicit borrow is needed.
+    // `dict_get` hands back a reference into the dictionary, and the field
+    // readers take `&Value`, so `.map(...)` needs no explicit re-borrow.
     //
     // `title` / `artist` go through tolerant readers (`.map(...)`) because the
     // MPRIS spec allows those keys to arrive as arrays (Chromium-family

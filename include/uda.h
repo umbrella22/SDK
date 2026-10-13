@@ -159,7 +159,7 @@
 /**
  * The state could not be determined. This is ALSO the code for "no media
  * player is running", which is not an error: `uda_media_get_status()` reports
- * it with a UDA_OK status. Never render it as a paused track.
+ * it with a `UDA_OK` status. Never render it as a paused track.
  */
 #define UDA_MEDIA_UNKNOWN 3
 
@@ -352,8 +352,9 @@ int32_t uda_wakelock_release(uint64_t handle);
  *
  * On Windows, toast *buttons* still require a packaged (MSIX) identity, so
  * `actions` is accepted for parity but not surfaced; the toast itself
- * displays normally. Use `WindowsNotificationManager::availability()` to
- * probe further.
+ * displays normally. Rust callers can probe further with
+ * `WindowsNotificationManager::availability()`; the C-ABI surface has no
+ * notification-availability probe.
  *
  * A trailing `key` without its `label` is dropped rather than rendered as a
  * blank button. The remaining FreeDesktop fields keep their defaults:
@@ -408,7 +409,10 @@ int32_t uda_get_accent_color(uint8_t *out_rgba);
  * unconditionally. A field the player does not publish (a radio stream with
  * no album, say) is NULL rather than an empty string, which lets a binding
  * skip it, while a field published as an empty string stays an empty string -
- * the two cases remain distinguishable. The artist list is already joined
+ * the two cases remain distinguishable on Linux. On Windows an empty read
+ * also surfaces as NULL, because SMTC has no "unset" marker on the wire, so
+ * a host must treat NULL as "skip this field" everywhere rather than as a
+ * Linux-only synonym for "unpublished". The artist list is already joined
  * with ", " when the player publishes several artists.
  *
  * `out_duration_ms` receives the track length in milliseconds, or 0 when

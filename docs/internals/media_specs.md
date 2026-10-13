@@ -71,7 +71,9 @@ org.freedesktop.DBus -> ListNames()
 - `xesam:title` 可能是 **数组**（Chromium 系历史上这么发过）。取首个元素即可，
   否则标题整段丢失。
 - 任何键都可能缺席（直播流、无元数据的本地文件）。缺席映射为 `None`（C-ABI
-  上是 NULL），不是错误；已发布但为空的值保持空字符串，两者可区分。
+  上是 NULL），不是错误；已发布但为空的值保持空字符串，两者可区分。这一
+  可区分性**仅 Linux 成立**：Windows 章节的 SMTC 没有线上"未发布"标记，
+  空读取同样折叠为 `None`（见 §3.4）。
 - `mpris:length` <= 0 表示直播或未知时长，映射为 `None` 而不是 0。
 
 ### 2.4 错误分层
@@ -127,6 +129,10 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
   写成 `/1_000_000` 会把 3 分钟算成 18 秒。
 - **`Duration` 为 0 不代表 0 毫秒**：SMTC 用 `TimeSpan::zero()` 表达"未知
   时长"，必须映射为 `None`。直播流、无时长信息的来源都会给 0。
+- **空串即"未发布"**：SMTC 线上没有"属性未设置"的标记，`published_or_none`
+  把空读取折叠为 `None`（C-ABI 上是 NULL）。Linux MPRIS 章节的
+  "已发布但为空保持空字符串"可区分性在 Windows 上因此**不成立**，宿主必须
+  两个平台统一把 NULL 当作"跳过该字段"。
 - **控制方法是 `Try*`**：返回 `false` 说明播放器拒绝（例如已暂停时再次
   Pause）。注意：当前实现把 `false` 与 HRESULT 失败都映射为
   `UdaError::CommandFailed`（见 `crates/uda-platform-windows/src/media.rs`），
@@ -145,7 +151,7 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 | `uda_media_get_metadata(out_title, out_artist, out_album: *mut *mut c_char, out_duration_ms, out_position_ms: *mut u64)` | 三个字符串 + 时长/进度槽 | 字符串由库分配，调用方用 `uda_free_string()` 释放；无元数据或字段未发布时写 NULL；`out_duration_ms` 写 0 表示未知；仅 `out_position_ms` 允许传 `NULL` 跳过 |
 | `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；无播放器返回 `UDA_ERR_NOT_SUPPORTED` |
 
-`out_title` / `out_artist` / `out_album` / `out_duration_ms` 四个出参指针必须非空（传 `NULL` 返回 `UDA_ERR_INVALID_ARGUMENT`）；未发布的字段以 NULL 指针（字符串）/ 0（数值）回填，而非空字符串。
+`out_title` / `out_artist` / `out_album` / `out_duration_ms` 四个出参指针必须非空（传 `NULL` 返回 `UDA_ERR_INVALID_ARGUMENT`）；未发布的字段以 NULL 指针（字符串）/ 0（数值）回填，而非空字符串。"已发布但为空保持空字符串"的可区分性仅 Linux 成立——Windows SMTC 线上没有"未发布"标记，空读取同样回填 NULL（§3.4），宿主在两个平台上都应把 NULL 当作"跳过该字段"。
 
 ## 5. 能力与降级
 

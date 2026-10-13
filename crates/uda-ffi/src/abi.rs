@@ -76,7 +76,7 @@ pub const UDA_MEDIA_PAUSED: i32 = 1;
 pub const UDA_MEDIA_STOPPED: i32 = 2;
 /// The state could not be determined. This is ALSO the code for "no media
 /// player is running", which is not an error: `uda_media_get_status()` reports
-/// it with a UDA_OK status. Never render it as a paused track.
+/// it with a `UDA_OK` status. Never render it as a paused track.
 pub const UDA_MEDIA_UNKNOWN: i32 = 3;
 
 // ---------------------------------------------------------------------------
@@ -167,7 +167,10 @@ mod tests {
     }
 
     /// The exported C-ABI names this crate's sources declare, gathered by
-    /// scanning `src/*.rs` the way the safety-classification gate does.
+    /// scanning `src/*.rs` for the two-line `#[no_mangle]` + `fn` convention.
+    /// This is the Rust-side leg of the parity check; CI's symbol gates
+    /// (`scripts/header_symbols.py`, `scripts/pe_exports.py`) cover the
+    /// header-to-built-library side.
     fn exported_names_from_sources() -> (Vec<String>, Vec<String>, Vec<String>) {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
         let mut functions = Vec::new();
@@ -181,6 +184,10 @@ mod tests {
                 continue;
             }
             let source = std::fs::read_to_string(&path).expect("readable Rust source");
+            // Only abi.rs's `pub type` aliases are C callback typedefs; other
+            // files define Rust-side type aliases (error.rs's `UdaStatus`,
+            // say) that never reach the header.
+            let is_abi = path.file_name().and_then(|n| n.to_str()) == Some("abi.rs");
             for line in source.lines() {
                 if line.trim() == "#[no_mangle]" {
                     pending_no_mangle = true;
@@ -188,17 +195,27 @@ mod tests {
                 }
                 if pending_no_mangle {
                     pending_no_mangle = false;
-                    if let Some(name) = identifier_after(line, " fn ") {
-                        functions.push(name);
+                    match identifier_after(line, " fn ") {
+                        Some(name) => functions.push(name),
+                        None => {
+                            // The scanner reads the two-line `#[no_mangle]` +
+                            // `pub ... fn` convention. Anything between them
+                            // (another attribute, a doc comment, a wrapped
+                            // signature) would silently drop a real export
+                            // and fail the parity test with a misleading
+                            // "re-run gen-header.sh"; fail with the actual
+                            // cause instead.
+                            panic!(
+                                "a `#[no_mangle]` in {path:?} is not immediately \
+                                 followed by its `fn` line; keep them adjacent or \
+                                 extend this scanner: {line:?}"
+                            );
+                        }
                     }
                 }
                 if let Some(name) = identifier_after(line, "pub const UDA_") {
                     constants.push(format!("UDA_{name}"));
                 }
-                // Only abi.rs's `pub type` aliases are C callback typedefs;
-                // other files define Rust-side type aliases (error.rs's
-                // `UdaStatus`, say) that never reach the header.
-                let is_abi = path.file_name().and_then(|n| n.to_str()) == Some("abi.rs");
                 if is_abi {
                     if let Some(name) = identifier_after(line, "pub type ") {
                         callbacks.push(name);
@@ -217,6 +234,15 @@ mod tests {
         // edit that invented one) without any script running. Sets compare in
         // both directions: adding an export without regenerating fails here,
         // and so does deleting one the header still declares.
+        //
+        // Known limitations of the hand-rolled parsing, all verified absent
+        // from the current cbindgen 0.29.4 output and all failing LOUDLY here
+        // (never as a silent pass): a comment line starting with `#define` or
+        // `typedef` would inflate the header sets, a `//` comment containing
+        // `/*` would swallow real declarations into the block-comment state,
+        // and an identifier ending in `_uda_x(` would be counted as a function
+        // named `uda_x`. If a cbindgen upgrade ever emits any of those shapes,
+        // harden the scanner then - the failure mode is a red test, not drift.
         let header_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../include/uda.h");
         let header = std::fs::read_to_string(&header_path).expect(

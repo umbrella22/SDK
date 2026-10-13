@@ -79,8 +79,16 @@ trap 'rm -f "$output"' EXIT
 
 # cbindgen renders negative constants bare (e.g. "#define UDA_ERR_IO -4"),
 # which would turn a caller's "-UDA_ERR_IO" into the token "--4". Wrap
-# negative literals in parentheses the way the header always has.
+# negative literals in parentheses the way the header always has. The wrap
+# only matches bare decimal literals, so fail loudly if any unwrapped
+# negative define survives (a future `-0x10` or `-(1 << 4)` spelling must
+# stop the generation here, not ship as `--...` tokens to callers).
 perl -pi -e 's/^(#define UDA_[A-Z0-9_]+) (-\d+)$/$1 ($2)/' "$output"
+if grep -nE '^#define UDA_[A-Za-z0-9_]+ -' "$output" >&2; then
+    echo "error: unwrapped negative constant(s) above would tokenize as" >&2
+    echo "       '--...' for callers; extend the wrapping step." >&2
+    exit 1
+fi
 
 if [ "$check" = true ]; then
     if ! diff -u "$HEADER" "$output"; then

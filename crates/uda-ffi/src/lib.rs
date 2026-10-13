@@ -238,8 +238,9 @@ pub extern "C" fn uda_wakelock_release(handle: u64) -> i32 {
 ///
 /// On Windows, toast *buttons* still require a packaged (MSIX) identity, so
 /// `actions` is accepted for parity but not surfaced; the toast itself
-/// displays normally. Use `WindowsNotificationManager::availability()` to
-/// probe further.
+/// displays normally. Rust callers can probe further with
+/// `WindowsNotificationManager::availability()`; the C-ABI surface has no
+/// notification-availability probe.
 ///
 /// A trailing `key` without its `label` is dropped rather than rendered as a
 /// blank button. The remaining FreeDesktop fields keep their defaults:
@@ -335,7 +336,10 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> i32 {
 /// unconditionally. A field the player does not publish (a radio stream with
 /// no album, say) is NULL rather than an empty string, which lets a binding
 /// skip it, while a field published as an empty string stays an empty string -
-/// the two cases remain distinguishable. The artist list is already joined
+/// the two cases remain distinguishable on Linux. On Windows an empty read
+/// also surfaces as NULL, because SMTC has no "unset" marker on the wire, so
+/// a host must treat NULL as "skip this field" everywhere rather than as a
+/// Linux-only synonym for "unpublished". The artist list is already joined
 /// with ", " when the player publishes several artists.
 ///
 /// `out_duration_ms` receives the track length in milliseconds, or 0 when
