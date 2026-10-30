@@ -281,6 +281,27 @@ pub(crate) fn set_icon_rgba(
             "`data` must not be null".to_string(),
         ));
     }
+    // Validate the geometry here so a malformed icon is an invalid-argument
+    // status (-1) rather than the "not supported" (-2) that uda-core's
+    // TrayIcon::set_icon would return: the caller violated the contract, the
+    // platform is fine. These checks mirror
+    // `TrayIconSource::validate` in uda-core, which re-validates before the OS
+    // sees any pixels, so the two copies must stay in sync; the duplication is
+    // deliberate (this one owns the -1 vs -2 status and the message), not an
+    // oversight to refactor away.
+    if width == 0 || height == 0 {
+        return Err(Failure::InvalidArgument(
+            "icon width and height must both be non-zero".to_string(),
+        ));
+    }
+    let row_bytes = width
+        .checked_mul(4)
+        .ok_or_else(|| Failure::InvalidArgument("icon width * 4 overflows".to_string()))?;
+    if stride < row_bytes {
+        return Err(Failure::InvalidArgument(format!(
+            "icon stride is smaller than width * 4: {stride} < {row_bytes} bytes"
+        )));
+    }
     let needed = stride
         .checked_mul(height)
         .ok_or_else(|| Failure::InvalidArgument("icon stride * height overflows".to_string()))?
@@ -345,19 +366,11 @@ pub(crate) fn menu_add_text(
     user_data: *mut c_void,
 ) -> Result<u64, Failure> {
     let menu = TrayRegistry::global().menu(menu_handle)?;
-    // Push first so the core model allocates the id: it is the authority on what
-    // the shell will see, and duplicating that numbering here would let the two
-    // disagree. The callback then needs a second lookup by label-free id, which
-    // `entries()` gives back, so the trampoline is attached in a second step.
-    menu.push(MenuItem::text(label))?;
-
-    // The id of the row just appended: the menu assigns ids monotonically, so
-    // the last entry is the one this call added.
-    let item_id = menu
-        .entries()
-        .last()
-        .map(|(id, _)| *id)
-        .ok_or_else(|| Failure::InvalidArgument("the menu dropped the new row".to_string()))?;
+    // `push` returns the id the core model assigned to *this* row. Using that
+    // value directly (rather than looking at `entries().last()`) keeps the
+    // callback attached to the row this call appended even when another thread
+    // appends to the same menu concurrently - the documented threading model.
+    let item_id = menu.push(MenuItem::text(label))?;
 
     if let Some(callback) = callback {
         let payload = SendVoidPtr(user_data);
@@ -404,14 +417,9 @@ pub(crate) fn menu_add_checkbox(
     } else {
         MenuItem::checkbox(label)
     };
-    menu.push(item)?;
-
-    // The id of the row just appended, for the same reason as in `menu_add_text`.
-    let item_id = menu
-        .entries()
-        .last()
-        .map(|(id, _)| *id)
-        .ok_or_else(|| Failure::InvalidArgument("the menu dropped the new row".to_string()))?;
+    // The id of the row this call appended, for the same reason as in
+    // `menu_add_text`: the returned id is authoritative under concurrent adds.
+    let item_id = menu.push(item)?;
 
     let payload = SendVoidPtr(user_data);
     // The menu is cloned into the closure so the trampoline can invert the
@@ -742,6 +750,36 @@ mod tests {
             menu_add_separator(menu).is_err(),
             "a destroyed menu must reject further rows"
         );
+    }
+
+    #[test]
+    fn malformed_icon_geometry_is_rejected_as_invalid_argument() {
+        let _guard = registry_guard();
+        let pixels = [0u8; 16];
+        // Handle 0 would also be rejected as an unknown handle with the same
+        // `InvalidArgument` status, so checking the status alone would pass
+        // even if the geometry checks never ran. Each case therefore also pins
+        // the geometry-specific fragment of the message, which the
+        // unknown-handle path cannot produce.
+        for (width, height, stride, len, fragment) in [
+            (0, 1, 4, 16, "width and height"),  // zero width
+            (1, 0, 4, 16, "width and height"),  // zero height
+            (2, 1, 4, 16, "stride is smaller"), // stride < width * 4
+            (1, 1, 4, 3, "shorter than"),       // len < stride * height
+        ] {
+            let result = set_icon_rgba(0, width, height, stride, pixels.as_ptr(), len);
+            let failure = result.expect_err("malformed icon geometry must be rejected");
+            assert!(
+                matches!(&failure, Failure::InvalidArgument(_)),
+                "({width}x{height}, stride {stride}, len {len}) must be invalid: {failure:?}"
+            );
+            assert!(
+                failure.message().contains(fragment),
+                "({width}x{height}, stride {stride}, len {len}) must fail the geometry check \
+                 ({fragment:?}), not some other validation; got: {}",
+                failure.message()
+            );
+        }
     }
 
     #[test]

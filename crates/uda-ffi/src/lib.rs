@@ -177,6 +177,14 @@ pub unsafe extern "C" fn uda_free_string(s: *mut c_char) {
 /// `*out_handle` receives a non-zero handle to pass to
 /// `uda_wakelock_release()`; on failure it is left untouched.
 ///
+/// On Linux, when the native IPC tiers are unavailable, the fallback holds
+/// the lock by running `systemd-inhibit` for at most 3600 seconds. That
+/// fallback lock expires silently at the cap and must be re-acquired; the
+/// native tiers are not capped. A successful acquire records no error message
+/// of its own, but it does not clear an unread message left by an earlier
+/// failure on the same thread; read `uda_last_error_message()` only after a
+/// non-`UDA_OK` status.
+///
 /// # Safety
 ///
 /// `out_handle` must point to a writable, non-null `uint64_t` location and
@@ -406,7 +414,13 @@ pub unsafe extern "C" fn uda_media_get_metadata(
 /// `UDA_MEDIA_UNKNOWN` to `*out_status`. `UDA_MEDIA_UNKNOWN` covers both "no
 /// player is running" and "the state could not be determined", and is
 /// reported with `UDA_OK`: it is an answer, not a failure. A negative status
-/// code means the platform has no media backend at all.
+/// code means the backend itself could not be reached: on Linux, connecting to
+/// the session bus or building the player proxy fails with
+/// `UDA_ERR_DETECTION_FAILED`; on Windows, acquiring the SMTC session manager
+/// fails with `UDA_ERR_NOT_SUPPORTED` or `UDA_ERR_DETECTION_FAILED`. A player
+/// session that *is* selected but whose state cannot be read is not a
+/// failure: that reports `UDA_OK` with `UDA_MEDIA_UNKNOWN`. On any negative
+/// status `*out_status` is left untouched.
 ///
 /// # Safety
 ///
@@ -774,13 +788,13 @@ pub unsafe extern "C" fn uda_tray_set_icon_path(handle: u64, path: *const c_char
 ///
 /// The buffer is borrowed: only `stride * height` bytes are copied and the
 /// caller keeps ownership of `data`. Pixels are top-down RGBA, four bytes
-/// each. A buffer shorter than `stride * height` is rejected before any
-/// pixel is read.
+/// each. A zero `width` or `height`, a `stride` smaller than `width * 4`, or
+/// a `len` smaller than `stride * height` is rejected with
+/// `UDA_ERR_INVALID_ARGUMENT` before any pixel is read.
 ///
 /// # Safety
 ///
-/// `data` must not be null and must point to `len` readable bytes. `width`
-/// and `height` must be non-zero and `stride` at least `width * 4`.
+/// `data` must not be null and must point to `len` readable bytes.
 #[no_mangle]
 pub unsafe extern "C" fn uda_tray_set_icon_rgba(
     handle: u64,
@@ -1041,11 +1055,68 @@ mod tests {
         assert_eq!(text, "");
         // SAFETY: same pointer, freed exactly once.
         unsafe { util::free_c_string(pointer) };
-        // Published text -> the text.
+        // Published text -> the text, read back verbatim.
         let pointer = c_string_or_null(Some("/music/track.flac"));
         assert!(!pointer.is_null());
-        // SAFETY: same ownership pattern as above.
+        // SAFETY: the pointer came from `c_string_from` in this test.
+        let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("the path is valid UTF-8");
+        assert_eq!(text, "/music/track.flac");
+        // SAFETY: same pointer, freed exactly once.
         unsafe { util::free_c_string(pointer) };
+    }
+
+    #[test]
+    fn media_get_metadata_rejects_a_null_out_parameter() {
+        // Every string slot and the duration slot are mandatory (the position
+        // slot is the only optional one). Validation runs before any backend
+        // call, so this needs no player.
+        //
+        // The slots start at sentinels rather than NULL/0: a rejected call must
+        // write nothing, and the documented empty answer is itself NULL/0, so a
+        // zeroed slot could not distinguish "untouched" from "overwritten".
+        // The sentinel pointer is only ever compared by address, never
+        // dereferenced, so it does not have to point at valid memory.
+        let sentinel: *mut c_char = std::ptr::NonNull::<c_char>::dangling().as_ptr();
+        let mut title = sentinel;
+        let mut artist = sentinel;
+        let mut album = sentinel;
+        let mut duration: u64 = 99;
+
+        // SAFETY: the pointers are live locals; `out_title` is deliberately
+        // null, which is exactly the case under test.
+        let status = unsafe {
+            uda_media_get_metadata(
+                std::ptr::null_mut(),
+                &mut artist,
+                &mut album,
+                &mut duration,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+
+        // SAFETY: `out_duration_ms` is deliberately null this time.
+        let status = unsafe {
+            uda_media_get_metadata(
+                &mut title,
+                &mut artist,
+                &mut album,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+
+        // A rejected call writes nothing into the slots it was given: had the
+        // null check fallen through into the body, these would be NULL/0 (the
+        // "no player" answer) instead of the sentinels.
+        assert_eq!(title, sentinel);
+        assert_eq!(artist, sentinel);
+        assert_eq!(album, sentinel);
+        assert_eq!(duration, 99);
     }
 
     #[test]

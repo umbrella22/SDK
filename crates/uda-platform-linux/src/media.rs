@@ -469,11 +469,12 @@ async fn read_metadata(
         return Ok(None);
     };
 
-    let metadata = metadata_from_dict(&dictionary);
-    if metadata.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(metadata))
+    // No all-empty check here: the outer `active_metadata` path already unwraps
+    // an `Ok(None)` to a default snapshot before merging in the separately-read
+    // position and normalising once afterwards. An inner check is therefore
+    // redundant; the outer merge preserves a position-only snapshot either way,
+    // so removing it leaves behavior unchanged.
+    Ok(Some(metadata_from_dict(&dictionary)))
 }
 
 /// Read the playback position in milliseconds.

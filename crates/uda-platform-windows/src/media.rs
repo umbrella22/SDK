@@ -142,6 +142,24 @@ pub(crate) async fn send_smtc_command(command: MediaCommand) -> Result<(), UdaEr
     run_command(&session, command).await
 }
 
+/// Interpret the `bool` a `Try*Async()` transport call returns.
+///
+/// Both `true` and `false` are successful WinRT calls; `false` means the
+/// session *refused* the command (or is not listening), which UDA reports as
+/// [`UdaError::CommandFailed`] so a caller can tell "sent" from "refused".
+/// Kept as a pure helper so the mapping is testable without a live SMTC
+/// session.
+fn command_outcome(accepted: bool, command: MediaCommand) -> Result<(), UdaError> {
+    if accepted {
+        Ok(())
+    } else {
+        Err(UdaError::CommandFailed(format!(
+            "the media session refused the command {:?}",
+            command.code()
+        )))
+    }
+}
+
 /// Invoke one transport method and report a refusal as an error.
 async fn run_command(
     session: &windows::Media::Control::GlobalSystemMediaTransportControlsSession,
@@ -160,11 +178,7 @@ async fn run_command(
     };
 
     match accepted {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(UdaError::CommandFailed(format!(
-            "the media session refused the command {:?}",
-            command.code()
-        ))),
+        Ok(accepted) => command_outcome(accepted, command),
         Err(e) => Err(UdaError::CommandFailed(format!("SMTC {e}"))),
     }
 }
@@ -173,17 +187,36 @@ async fn run_command(
 ///
 /// `Ok(None)` covers both "no session is playing" and "the session published no
 /// usable fields", so a caller cannot distinguish them - and does not need to,
-/// because neither is a failure.
+/// because neither is a failure. A property read that fails after the session
+/// was selected (the `TryGetMediaPropertiesAsync` request or its awaited
+/// result) also reports `Ok(None)`: the session stopped answering mid-call,
+/// which is a normal race rather than a backend failure.
+///
+/// These read-failure branches cannot be injected from a unit test - they need
+/// a live SMTC session that fails between selection and the read - so they are
+/// verified by inspection only; the tests below cover the pure mapping helpers.
 async fn active_metadata_async() -> Result<Option<MediaMetadata>, UdaError> {
     let Some(session) = WindowsMediaManager::current_session().await? else {
         return Ok(None);
     };
 
-    let properties = session
-        .TryGetMediaPropertiesAsync()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC media properties: {e}")))?
-        .get()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC media properties: {e}")))?;
+    let properties = match session.TryGetMediaPropertiesAsync() {
+        Ok(operation) => match operation.get() {
+            Ok(properties) => properties,
+            Err(e) => {
+                log::debug!(
+                    "SMTC media properties could not be read ({e}); treating as no metadata"
+                );
+                return Ok(None);
+            }
+        },
+        Err(e) => {
+            log::debug!(
+                "SMTC media properties could not be requested ({e}); treating as no metadata"
+            );
+            return Ok(None);
+        }
+    };
 
     // `Artist` is a single string on Windows (MPRIS publishes a list, which is
     // joined on the Linux side); no post-processing is needed here. An absent
@@ -242,19 +275,36 @@ fn ticks_of(timespan: windows::core::Result<windows::Foundation::TimeSpan>) -> i
 /// Read the playback status of the current session.
 ///
 /// With no session the status is `Unknown` rather than `Stopped`: nothing is
-/// loaded, which is exactly what `Stopped` would claim to know.
+/// loaded, which is exactly what `Stopped` would claim to know. A selected
+/// session whose `GetPlaybackInfo()` or `PlaybackStatus()` read fails also
+/// reports `Unknown` with `Ok`: the session stopped answering mid-call, which
+/// is a normal race, not a backend failure. Those branches cannot be injected
+/// from a unit test without a live SMTC session that fails mid-read, so they
+/// are verified by inspection; the tests below cover `status_from_smtc`.
 async fn playback_status_async() -> Result<PlaybackStatus, UdaError> {
     let Some(session) = WindowsMediaManager::current_session().await? else {
         return Ok(PlaybackStatus::Unknown);
     };
 
-    let info = session
-        .GetPlaybackInfo()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC playback info: {e}")))?;
+    // A session that stops answering between the two calls has not published a
+    // readable state; report "cannot tell" (`Unknown`) with a successful call
+    // rather than turning a normal race into a failure. Only the absence of the
+    // SMTC backend itself (in `session_manager`) is `NotSupported`.
+    let info = match session.GetPlaybackInfo() {
+        Ok(info) => info,
+        Err(e) => {
+            log::debug!("SMTC playback info could not be read ({e}); reporting Unknown");
+            return Ok(PlaybackStatus::Unknown);
+        }
+    };
 
-    let status = info
-        .PlaybackStatus()
-        .map_err(|e| UdaError::DetectionFailed(format!("SMTC playback status: {e}")))?;
+    let status = match info.PlaybackStatus() {
+        Ok(status) => status,
+        Err(e) => {
+            log::debug!("SMTC playback status could not be read ({e}); reporting Unknown");
+            return Ok(PlaybackStatus::Unknown);
+        }
+    };
 
     Ok(status_from_smtc(status))
 }
@@ -347,21 +397,23 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_command_with_no_session_to_address_is_an_error() {
-        // The asymmetry: a read has nothing to say, but a command has nothing to
-        // send *to*. Reporting success there would let a caller believe it paused
-        // something.
-        let outcome: Result<(), UdaError> = Err(UdaError::NotSupported(
-            "no media session is currently playing".to_string(),
-        ));
+    // No unit test covers the "no session to address" branch of
+    // `send_smtc_command`: exercising it needs a live SMTC manager, and on a
+    // machine with a player the call would execute the command instead of
+    // taking that branch. The branch itself is a direct
+    // `Err(UdaError::NotSupported(..))`; its contract is stated in the
+    // function's doc.
 
-        match outcome {
-            Err(UdaError::NotSupported(message)) => {
-                assert!(message.contains("no media session"), "message: {message}");
-            }
-            other => panic!("expected NotSupported, got {other:?}"),
-        }
+    #[test]
+    fn an_empty_smtc_property_reads_as_unpublished() {
+        // SMTC has no "unset" marker: a property the session does not publish
+        // reads back as an empty string, which must become `None` (NULL on the
+        // C ABI) rather than an empty string.
+        assert_eq!(published_or_none(String::new()), None);
+        assert_eq!(
+            published_or_none("Album".to_string()),
+            Some("Album".to_string())
+        );
     }
 
     #[test]
@@ -377,13 +429,13 @@ mod tests {
         // The `Ok(false)` branch is the SMTC-specific quirk: the WinRT call
         // succeeded but the session declined. A caller must be able to tell that
         // apart from "sent", which is why it maps to `CommandFailed`.
-        let outcome: Result<(), UdaError> = Err(UdaError::CommandFailed(
-            "the media session refused the command 2".to_string(),
-        ));
-
-        match outcome {
+        match command_outcome(false, MediaCommand::TogglePlayPause) {
             Err(UdaError::CommandFailed(message)) => {
                 assert!(message.contains("refused"), "message: {message}");
+                assert!(
+                    message.contains('2'),
+                    "the command code is quoted: {message}"
+                );
             }
             other => panic!("expected a CommandFailed, got {other:?}"),
         }
@@ -393,8 +445,7 @@ mod tests {
     fn an_accepted_command_is_reported_as_success() {
         // A `true` reply only means the session accepted the command; it can
         // still fail inside the app, and that is indistinguishable from here.
-        let accepted: Result<bool, UdaError> = Ok(true);
-        assert_eq!(accepted.ok(), Some(true));
+        assert!(command_outcome(true, MediaCommand::Play).is_ok());
     }
 
     #[test]

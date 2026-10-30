@@ -151,6 +151,16 @@ mod tests {
         assert_eq!(UDA_ERR_PANIC, -6);
     }
 
+    #[test]
+    fn theme_codes_match_the_documented_values() {
+        // Literals, not the constants against themselves: `dispatch.rs` maps
+        // `Theme` onto these constants, so only pinning the numbers here proves
+        // the mapping still lands on the values `include/uda.h` documents.
+        assert_eq!(UDA_THEME_UNKNOWN, 0);
+        assert_eq!(UDA_THEME_DARK, 1);
+        assert_eq!(UDA_THEME_LIGHT, 2);
+    }
+
     /// Pull the identifier after a marker out of one source/header line.
     fn identifier_after(line: &str, marker: &str) -> Option<String> {
         let start = line.find(marker)? + marker.len();

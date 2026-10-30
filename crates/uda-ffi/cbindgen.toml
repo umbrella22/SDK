@@ -14,6 +14,16 @@ language = "c"
 # The hand-written header this replaces always wrapped the declarations in
 # `#ifdef __cplusplus extern "C"`, and C++ consumers of the released header
 # rely on it; keep that guarantee.
+#
+# NOTE: cbindgen emits the two callback typedefs (UdaTrayTextCallback and
+# UdaTrayCheckboxCallback) *before* that `extern "C"` block, because they are
+# ordinary C typedefs rather than function declarations. The placement is valid
+# C and C++ and does not change any exported symbol; scripts/test-header.py
+# compiles the header as C++11 and assigns an `extern "C"` function to each
+# typedef, which keeps the typedefs usable from C++. The placement itself is an
+# accepted cbindgen property, not something this repository post-processes -
+# rewriting generated output to move the typedefs would be fragile and buys
+# nothing.
 cpp_compat = true
 
 # The header stays self-contained: only the two standard includes the ABI

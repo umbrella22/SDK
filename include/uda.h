@@ -318,6 +318,14 @@ void uda_free_string(char *s);
  * `*out_handle` receives a non-zero handle to pass to
  * `uda_wakelock_release()`; on failure it is left untouched.
  *
+ * On Linux, when the native IPC tiers are unavailable, the fallback holds
+ * the lock by running `systemd-inhibit` for at most 3600 seconds. That
+ * fallback lock expires silently at the cap and must be re-acquired; the
+ * native tiers are not capped. A successful acquire records no error message
+ * of its own, but it does not clear an unread message left by an earlier
+ * failure on the same thread; read `uda_last_error_message()` only after a
+ * non-`UDA_OK` status.
+ *
  * # Safety
  *
  * `out_handle` must point to a writable, non-null `uint64_t` location and
@@ -439,7 +447,13 @@ int32_t uda_media_get_metadata(char **out_title,
  * `UDA_MEDIA_UNKNOWN` to `*out_status`. `UDA_MEDIA_UNKNOWN` covers both "no
  * player is running" and "the state could not be determined", and is
  * reported with `UDA_OK`: it is an answer, not a failure. A negative status
- * code means the platform has no media backend at all.
+ * code means the backend itself could not be reached: on Linux, connecting to
+ * the session bus or building the player proxy fails with
+ * `UDA_ERR_DETECTION_FAILED`; on Windows, acquiring the SMTC session manager
+ * fails with `UDA_ERR_NOT_SUPPORTED` or `UDA_ERR_DETECTION_FAILED`. A player
+ * session that *is* selected but whose state cannot be read is not a
+ * failure: that reports `UDA_OK` with `UDA_MEDIA_UNKNOWN`. On any negative
+ * status `*out_status` is left untouched.
  *
  * # Safety
  *
@@ -700,13 +714,13 @@ int32_t uda_tray_set_icon_path(uint64_t handle, const char *path);
  *
  * The buffer is borrowed: only `stride * height` bytes are copied and the
  * caller keeps ownership of `data`. Pixels are top-down RGBA, four bytes
- * each. A buffer shorter than `stride * height` is rejected before any
- * pixel is read.
+ * each. A zero `width` or `height`, a `stride` smaller than `width * 4`, or
+ * a `len` smaller than `stride * height` is rejected with
+ * `UDA_ERR_INVALID_ARGUMENT` before any pixel is read.
  *
  * # Safety
  *
- * `data` must not be null and must point to `len` readable bytes. `width`
- * and `height` must be non-zero and `stride` at least `width * 4`.
+ * `data` must not be null and must point to `len` readable bytes.
  */
 int32_t uda_tray_set_icon_rgba(uint64_t handle,
                                uint32_t width,

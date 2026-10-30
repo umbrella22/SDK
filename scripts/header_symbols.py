@@ -52,7 +52,10 @@ def header_symbols(header: pathlib.Path) -> list[str]:
         # comments outright: none of them can hold a declaration.
         if stripped.startswith(("*", "/", "#")):
             continue
-        match = _DECLARATION.match(line)
+        # Match the stripped text, not the raw line: the declaration pattern is
+        # anchored at column 0, so an indented declaration (for example inside
+        # a future `#if` block) would otherwise be skipped silently.
+        match = _DECLARATION.match(stripped)
         if match:
             names.add(match.group(1))
     return sorted(names)

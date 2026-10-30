@@ -81,9 +81,12 @@ pub struct MediaMetadata {
 }
 
 impl MediaMetadata {
-    /// Whether this snapshot carries no usable information at all, turning "the
-    /// player answered but said nothing" into the same `Ok(None)` a host with no
-    /// player gets.
+    /// Whether this snapshot carries no usable information at all: every string
+    /// field is unpublished (`None`) and both numeric fields are unknown
+    /// (`None`). A field published as an empty string is published - `Some("")`
+    /// therefore keeps the snapshot non-empty - so this predicate must not be
+    /// read as "all values are blank". Used to turn an all-unpublished read into
+    /// the same `Ok(None)` a host with no player gets.
     pub fn is_empty(&self) -> bool {
         self.title.is_none()
             && self.artist.is_none()
@@ -151,10 +154,21 @@ pub trait MediaManager {
     /// be read rather than an error.
     fn playback_status(&self) -> Result<PlaybackStatus, UdaError>;
 
-    /// Send `command` to the active player. A player that refuses the command
-    /// (pausing an already-paused stream, for instance) is still a successful
-    /// call: the platform cannot distinguish "declined" from "done", and an error
-    /// would make a normal toggle look like a failure.
+    /// Send `command` to the active player.
+    ///
+    /// Once a player has been selected, a refusal or a transport failure is
+    /// [`UdaError::CommandFailed`]. Reaching a player at all can fail first,
+    /// and those acquisition failures keep their own types: no player to
+    /// address, a missing SMTC manager, or a manager acquisition await that
+    /// fails is [`UdaError::NotSupported`]; a Linux session-bus connection
+    /// failure or a Windows SMTC manager `RequestAsync` failure is
+    /// [`UdaError::DetectionFailed`]; and runtime/proxy setup can be
+    /// [`UdaError::Internal`] - so a non-`Ok` result does not always mean "the
+    /// player declined". Whether a refusal *should* instead count as a
+    /// successful call (the platform cannot always distinguish "declined" from
+    /// "done") is an open cross-platform design question; until it is settled,
+    /// callers must treat a non-`Ok` result as "success was not confirmed"
+    /// rather than retrying blindly. See `docs/internals/media_specs.md` §3.4.
     fn send_command(&self, command: MediaCommand) -> Result<(), UdaError>;
 
     /// The capabilities this platform's media backend can honour.
@@ -232,6 +246,19 @@ mod tests {
     fn a_title_alone_is_enough_to_be_non_empty() {
         let metadata = MediaMetadata {
             title: Some("Song".to_string()),
+            ..MediaMetadata::default()
+        };
+        assert!(!metadata.is_empty());
+    }
+
+    #[test]
+    fn a_published_empty_title_is_published_not_empty() {
+        // `is_empty` asks "all fields unpublished", not "all values blank": a
+        // player that publishes an empty title has still published something.
+        // On Linux the C ABI keeps that distinction as an empty string vs NULL;
+        // Windows SMTC has no unpublished marker and folds empty reads to NULL.
+        let metadata = MediaMetadata {
+            title: Some(String::new()),
             ..MediaMetadata::default()
         };
         assert!(!metadata.is_empty());

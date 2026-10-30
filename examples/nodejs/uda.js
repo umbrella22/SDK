@@ -863,11 +863,13 @@ class MediaController {
     const durationMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, durationSlot));
     const positionMs = Number(this._uda._lib.readSlot(this._uda._types.uint64, positionSlot));
 
-    // "无播放器"与"所有字段都未发布"在库端都是三个 NULL + 时长 0；播放器把
-    // 每个字段都发布成空串时，库端会保留空 C 串（与 NULL 可区分），绑定层
-    // 同样把它归一成 null：示例只关心"有没有可展示的元数据"，否则调用方拿
-    // 到一个空壳对象，打印出一堆"(未发布)"。
-    if (!title && !artist && !album && durationMs === 0) {
+    // "无播放器"与"所有字段（含进度）都未发布"在库端都是三个 NULL + 时长/进度
+    // 0；播放器把每个字段都发布成空串时，库端会保留空 C 串以便与 NULL 区分，
+    // 但这仅 Linux 成立；Windows 上 SMTC 无法区分，库端已折叠为 NULL。绑定层
+    // 仍把"全空"归一成 null：示例只关心"有没有可展示的元数据"，否则调用方拿
+    // 到一个空壳对象，打印出一堆"(未发布)"；只有进度（positionMs）非 0 的快照
+    // 仍是播放器快照，不能因为标题等字段为空就判定为无播放器。
+    if (!title && !artist && !album && durationMs === 0 && positionMs === 0) {
       return null;
     }
 

@@ -39,10 +39,12 @@ use crate::error::Failure;
 ///
 /// `systemd-inhibit --mode=block` returns as soon as its child exits, so the
 /// child is a `sleep` bounded by this value. The lock is therefore *not*
-/// indefinite, which the C caller is told about through
-/// `uda_last_error_message()` when the tier is used. Implementation detail,
-/// not C-ABI surface: the ignore annotation keeps cbindgen from scanning (and
-/// warning about) a private constant it would otherwise visit.
+/// indefinite; the C caller is told about the cap in the public
+/// `uda_wakelock_acquire` documentation, not through
+/// `uda_last_error_message()` (a successful acquire records no message).
+/// Implementation detail, not C-ABI surface: the ignore annotation keeps
+/// cbindgen from scanning (and warning about) a private constant it would
+/// otherwise visit.
 const CLI_LOCK_SECONDS: u64 = 3600;
 
 /// How a live entry must be released.
