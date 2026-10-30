@@ -339,7 +339,9 @@ struct MenuRow {
     checked: bool,
     /// Whether the row is purely visual.
     separator: bool,
-    /// Nested rows, with their own contiguous id range.
+    /// Nested rows. Their ids come from the shared [`MenuIdMap`], so a
+    /// submenu's ids are independent of the parent's and are not a contiguous
+    /// range: stability across snapshots takes precedence.
     children: Vec<MenuRow>,
     /// Callback fired when the shell reports this row as clicked.
     ///
@@ -488,8 +490,9 @@ fn owned_props(props: HashMap<&'static str, zvariant::Value<'_>>) -> OwnedProps 
 }
 
 /// Keep only the property names the shell asked for; an empty list asks for
-/// all of them, which is how both `GetGroupProperties` and `GetProperty`
-/// express "no filter".
+/// all of them, which is how `GetGroupProperties` expresses "no filter".
+/// `GetProperty` names exactly one property, so it reads it directly instead
+/// of going through this filter.
 fn filtered_props<'a>(
     props: HashMap<&'static str, zvariant::Value<'a>>,
     wanted: &[&str],
@@ -1371,63 +1374,35 @@ impl Worker {
     }
 
     async fn run_async(mut self) {
-        let connection = match Connection::session().await {
-            Ok(connection) => connection,
-            Err(error) => {
-                log::warn!("tray worker found no session bus: {error}");
-                self.report(WorkerReady::Failed(format!("no session bus: {error}")));
+        // Registration as a whole is bounded, not just the readiness handshake
+        // `create` performs: a session bus that accepts the connection but then
+        // stalls on `RequestName`, object export or the watcher call must not
+        // leak this worker thread - nor register a ghost item after `create`
+        // has already given up. On timeout the worker simply exits; the
+        // object-server entries die with the connection.
+        let startup = tokio::time::timeout(READY_TIMEOUT, self.start()).await;
+        let (connection, sni_context, menu_context, degraded) = match startup {
+            Ok(Ok(started)) => started,
+            Ok(Err(failure)) => {
+                // `start` logged the specific cause; the verdict is one-shot.
+                self.report(failure);
+                return;
+            }
+            Err(_) => {
+                log::warn!(
+                    "tray registration did not finish within {READY_TIMEOUT:?}; \
+                     abandoning the worker"
+                );
+                self.report(WorkerReady::Failed(format!(
+                    "tray registration did not finish within {READY_TIMEOUT:?}"
+                )));
                 return;
             }
         };
 
-        // A unique bus name keeps several icons in one process from colliding.
-        if let Err(error) = connection.request_name(self.bus_name.as_str()).await {
-            log::warn!("tray bus name '{}' was refused: {error}", self.bus_name);
-            self.report(WorkerReady::Failed(format!(
-                "the bus name {} was refused: {error}",
-                self.bus_name
-            )));
-            return;
-        }
-
-        let item = StatusNotifierItemInterface::new(Arc::clone(&self.shared));
-        let menu = DBusMenuInterface::new(Arc::clone(&self.shared), Arc::clone(&self.revision));
-
-        let server = connection.object_server();
-        if let Err(error) = server.at(SNI_PATH, item).await {
-            log::warn!("tray could not export {SNI_PATH}: {error}");
-            self.report(WorkerReady::Failed(format!(
-                "could not export {SNI_PATH}: {error}"
-            )));
-            return;
-        }
-        if let Err(error) = server.at(MENU_PATH, menu).await {
-            log::warn!("tray could not export {MENU_PATH}: {error}");
-            self.report(WorkerReady::Failed(format!(
-                "could not export {MENU_PATH}: {error}"
-            )));
-            return;
-        }
-
-        // Both paths are compile-time constants, so these contexts cannot fail
-        // to build; `SignalContext::new` would only re-parse the same strings.
-        let sni_context = SignalContext::from_parts(
-            connection.clone(),
-            zvariant::ObjectPath::from_static_str_unchecked(SNI_PATH),
-        );
-        let menu_context = SignalContext::from_parts(
-            connection.clone(),
-            zvariant::ObjectPath::from_static_str_unchecked(MENU_PATH),
-        );
-
-        // A missing watcher is not fatal: the item stays exported, so a watcher
-        // that starts later can still find it. It is a degradation, though, and
-        // it is reported as one instead of being logged into silence.
-        if let Err(error) = register_with_watcher(&connection, &self.bus_name).await {
-            log::warn!("tray registered without a watcher ({error}); the shell may not show it");
-            self.report(WorkerReady::Degraded(error.to_string()));
-        } else {
-            self.report(WorkerReady::Ready);
+        match degraded {
+            Some(reason) => self.report(WorkerReady::Degraded(reason)),
+            None => self.report(WorkerReady::Ready),
         }
 
         log::info!("tray item '{}' is live", self.bus_name);
@@ -1446,6 +1421,102 @@ impl Worker {
         }
 
         self.shutdown(&connection).await;
+    }
+
+    /// Connect, export both interfaces and register with the watcher.
+    ///
+    /// Every fatal step returns the [`WorkerReady::Failed`] verdict `create`
+    /// must see; a registration that reached the watcher but was refused comes
+    /// back as a degradation reason, because the item itself is still exported
+    /// and serviceable. The whole future is wrapped in one [`READY_TIMEOUT`] by
+    /// [`Self::run_async`], so no individual step here needs a timeout of its
+    /// own to keep the worker bounded.
+    async fn start(
+        &mut self,
+    ) -> Result<
+        (
+            Connection,
+            SignalContext<'static>,
+            SignalContext<'static>,
+            Option<String>,
+        ),
+        WorkerReady,
+    > {
+        let connection = match Connection::session().await {
+            Ok(connection) => connection,
+            Err(error) => {
+                log::warn!("tray worker found no session bus: {error}");
+                return Err(WorkerReady::Failed(format!("no session bus: {error}")));
+            }
+        };
+
+        // A unique bus name keeps several icons in one process from colliding.
+        if let Err(error) = connection.request_name(self.bus_name.as_str()).await {
+            log::warn!("tray bus name '{}' was refused: {error}", self.bus_name);
+            return Err(WorkerReady::Failed(format!(
+                "the bus name {} was refused: {error}",
+                self.bus_name
+            )));
+        }
+
+        let item = StatusNotifierItemInterface::new(Arc::clone(&self.shared));
+        let menu = DBusMenuInterface::new(Arc::clone(&self.shared), Arc::clone(&self.revision));
+
+        // The object server borrows the connection, so it is scoped to this
+        // block: the connection itself is returned to `run_async` afterwards.
+        {
+            let server = connection.object_server();
+            if let Err(error) = server.at(SNI_PATH, item).await {
+                log::warn!("tray could not export {SNI_PATH}: {error}");
+                return Err(WorkerReady::Failed(format!(
+                    "could not export {SNI_PATH}: {error}"
+                )));
+            }
+            if let Err(error) = server.at(MENU_PATH, menu).await {
+                log::warn!("tray could not export {MENU_PATH}: {error}");
+                return Err(WorkerReady::Failed(format!(
+                    "could not export {MENU_PATH}: {error}"
+                )));
+            }
+        }
+
+        // Both paths are compile-time constants, so these contexts cannot fail
+        // to build; `SignalContext::new` would only re-parse the same strings.
+        let sni_context = SignalContext::from_parts(
+            connection.clone(),
+            zvariant::ObjectPath::from_static_str_unchecked(SNI_PATH),
+        );
+        let menu_context = SignalContext::from_parts(
+            connection.clone(),
+            zvariant::ObjectPath::from_static_str_unchecked(MENU_PATH),
+        );
+
+        // A missing watcher is not fatal: the item stays exported, so a watcher
+        // that starts later can still find it. It is a degradation, though, and
+        // it is reported as one instead of being logged into silence. The
+        // reason travels without the `NotSupported` display prefix, so the
+        // host-visible degradation names the actual problem.
+        let degraded = match register_with_watcher(&connection, &self.bus_name).await {
+            Ok(()) => None,
+            Err(UdaError::NotSupported(reason)) => {
+                log::warn!(
+                    "tray registered without a watcher ({reason}); the shell may not show it"
+                );
+                Some(reason)
+            }
+            Err(error) => {
+                // A transport-level failure means the item may no longer be
+                // exported at all, so this is not a degradation: report it as
+                // a failed registration and let `create` fail instead of
+                // handing back an icon that is not on the bus.
+                log::warn!("tray watcher registration failed: {error}");
+                return Err(WorkerReady::Failed(format!(
+                    "tray watcher registration failed: {error}"
+                )));
+            }
+        };
+
+        Ok((connection, sni_context, menu_context, degraded))
     }
 
     /// Mirror the host state and announce whatever the shell must re-read.
@@ -1563,9 +1634,24 @@ impl Worker {
 }
 
 /// Register the item with a StatusNotifierWatcher: the KDE interface first, then
-/// the freedesktop one (`tray_specs.md` §1.6), erroring when neither is
-/// reachable.
+/// the freedesktop one (`tray_specs.md` §1.6), erroring when neither accepts it.
+///
+/// The returned reason distinguishes the two failure modes the caller can
+/// actually act on: no watcher is there at all ("unreachable"), or a watcher
+/// answered and refused the registration ("rejected"). Reporting both as "no
+/// watcher is reachable" would hide a shell-side refusal behind a misleading
+/// diagnosis.
+///
+/// `zbus::Proxy::new` is lazy in zbus 4.4 - it does not touch the bus - so the
+/// first real round trip is the `RegisterStatusNotifierItem` call itself. A
+/// missing watcher therefore answers `ServiceUnknown`/`NameHasNoOwner` from
+/// that call, and a watcher that only implements the KDE interface answers
+/// `UnknownInterface`/`UnknownMethod` for the fallback attempt; both mean "no
+/// usable watcher here" and are classified as unreachable. Any other method
+/// error is a shell-side refusal of the item.
 async fn register_with_watcher(connection: &Connection, service: &str) -> Result<(), UdaError> {
+    let mut last_unreachable: Option<String> = None;
+    let mut last_rejection: Option<String> = None;
     for interface_name in [WATCHER_INTERFACE, WATCHER_FALLBACK_INTERFACE] {
         let proxy =
             match zbus::Proxy::new(connection, WATCHER_SERVICE, WATCHER_PATH, interface_name).await
@@ -1573,6 +1659,8 @@ async fn register_with_watcher(connection: &Connection, service: &str) -> Result
                 Ok(proxy) => proxy,
                 Err(error) => {
                     log::debug!("tray watcher {interface_name} unreachable: {error}");
+                    last_unreachable =
+                        Some(format!("{interface_name} could not be reached: {error}"));
                     continue;
                 }
             };
@@ -1586,12 +1674,104 @@ async fn register_with_watcher(connection: &Connection, service: &str) -> Result
             }
             Err(error) => {
                 log::debug!("tray registration on {interface_name} failed: {error}");
+                if watcher_error_is_fatal(&error) {
+                    // The bus connection itself is broken (or the daemon
+                    // reports a terminal transport error): the item is no
+                    // longer guaranteed to be exported, so `create` must fail
+                    // rather than claim a degraded but live icon.
+                    return Err(UdaError::Internal(format!(
+                        "tray watcher transport failure: {error}"
+                    )));
+                }
+                if watcher_error_is_unreachable(&error) {
+                    last_unreachable =
+                        Some(format!("{interface_name} could not be reached: {error}"));
+                } else {
+                    last_rejection = Some(format!("{interface_name} refused the item: {error}"));
+                }
             }
         }
     }
-    Err(UdaError::NotSupported(
-        "no StatusNotifierWatcher is reachable on the session bus".to_string(),
-    ))
+    let reason = match (last_rejection, last_unreachable) {
+        (Some(rejection), _) => {
+            format!("the StatusNotifierWatcher rejected the registration: {rejection}")
+        }
+        (None, Some(unreachable)) => {
+            format!("no StatusNotifierWatcher is reachable on the session bus: {unreachable}")
+        }
+        // Unreachable in practice (the loop always sets one of the two), but a
+        // reason is still required rather than an `expect`.
+        (None, None) => "no StatusNotifierWatcher is reachable on the session bus".to_string(),
+    };
+    Err(UdaError::NotSupported(reason))
+}
+
+/// Whether a failed registration means there is no watcher rather than a
+/// watcher refusing the item.
+///
+/// Only a D-Bus method error can be the watcher's own answer; it is classified
+/// as unreachable for the names that mean "service/method not there", and as a
+/// rejection for the rest. A non-method error is a transport/protocol failure
+/// handled by [`watcher_error_is_fatal`], never a refusal the shell made.
+fn watcher_error_is_unreachable(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => watcher_error_name_is_unreachable(name.as_str()),
+        _ => false,
+    }
+}
+
+/// Whether a failed registration invalidates the exported item itself.
+///
+/// A broken connection, handshake failure or bus-daemon transport error means
+/// the item may no longer be on the bus at all, so the worker must report a
+/// failed registration rather than a degraded-but-live icon. The method-error
+/// names below are terminal transport errors reported by the daemon; a
+/// method-level timeout (`Error.Timeout`) is handled as "no watcher answered",
+/// not as a broken connection.
+fn watcher_error_is_fatal(error: &zbus::Error) -> bool {
+    match error {
+        zbus::Error::MethodError(name, _, _) => watcher_error_name_is_fatal(name.as_str()),
+        _ => true,
+    }
+}
+
+/// The D-Bus error names that mean the connection or daemon is gone.
+///
+/// Split out so the classification is unit-testable without constructing a
+/// `zbus::Message`.
+fn watcher_error_name_is_fatal(name: &str) -> bool {
+    matches!(
+        name,
+        "org.freedesktop.DBus.Error.Disconnected"
+            | "org.freedesktop.DBus.Error.IOError"
+            | "org.freedesktop.DBus.Error.NoServer"
+            | "org.freedesktop.DBus.Error.NoNetwork"
+    )
+}
+
+/// The D-Bus error names that mean "the peer or method is not there".
+///
+/// Split out as a pure string check so the classification is unit-testable
+/// without a bus.
+fn watcher_error_name_is_unreachable(name: &str) -> bool {
+    // Any bus-daemon activation failure means the watcher could not be
+    // started, not that a live watcher refused the item; the D-Bus spawn error
+    // names are open-ended (`Spawn.ExecFailed`, `Spawn.ForkFailed`,
+    // `Spawn.Timeout`, ...), so match the namespace instead of listing them.
+    name.starts_with("org.freedesktop.DBus.Error.Spawn.")
+        || matches!(
+            name,
+            "org.freedesktop.DBus.Error.ServiceUnknown"
+                | "org.freedesktop.DBus.Error.NameHasNoOwner"
+                | "org.freedesktop.DBus.Error.UnknownInterface"
+                | "org.freedesktop.DBus.Error.UnknownMethod"
+                | "org.freedesktop.DBus.Error.UnknownObject"
+                // The watcher never answered, which is absence rather than a
+                // refusal.
+                | "org.freedesktop.DBus.Error.NoReply"
+                | "org.freedesktop.DBus.Error.TimedOut"
+                | "org.freedesktop.DBus.Error.Timeout"
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1688,6 +1868,14 @@ impl LinuxTrayManager {
     /// `Connection::session()` is exactly the dishonest success the readiness
     /// handshake exists to prevent.
     ///
+    /// Two independent bounds cover a stalled worker. On this side,
+    /// [`readiness_outcome`] gives up after [`READY_TIMEOUT`], and dropping the
+    /// returned sender disconnects the command channel so a worker still coming
+    /// up stops. On the worker side, registration itself - connect, request the
+    /// name, export the interfaces, register with the watcher - is wrapped in
+    /// the same [`READY_TIMEOUT`], so a wedged D-Bus call cannot keep the
+    /// thread alive (or register a ghost item) after `create` already failed.
+    ///
     /// The readiness verdict travels back with the sender: `Ok(None)` - live
     /// and healthy; `Ok(Some(reason))` - live but degraded, with the reason to
     /// record on the icon before it reaches the host; `Err` - no icon to hand
@@ -1760,24 +1948,15 @@ fn readiness_outcome(
     }
 }
 
-/// Copy the registration-time values into the host-visible state, which both
-/// halves read: the host through its accessors, the worker through
-/// [`TrayShared::sync_from`]. Seeding it in one place keeps a freshly created
-/// icon self-consistent.
-fn seed_host_state(inner: &uda_core::tray::TrayIconInner, config: &TrayIconConfig) {
-    let mut state = inner.lock_state();
-    state.tooltip = config.tooltip.clone();
-    state.icon = config.icon.clone();
-    state.menu = config.menu.clone();
-    state.visible = true;
-}
-
 impl TrayManager for LinuxTrayManager {
     fn create(&self, config: TrayIconConfig) -> Result<TrayIcon, UdaError> {
         let inner = Arc::new(uda_core::tray::TrayIconInner::new(config.name.clone()));
         let icon = TrayIcon::from_inner(Arc::clone(&inner));
 
-        seed_host_state(&inner, &config);
+        // The host through its accessors and the worker through
+        // `TrayShared::sync_from` read the same seed, so a freshly created icon
+        // is self-consistent.
+        inner.seed_from_config(&config);
 
         // A `Box<dyn FnMut>` cannot be cloned, so this is the only chance to
         // move the callbacks into the worker state.
@@ -2691,9 +2870,9 @@ mod tests {
             on_click: None,
             on_double_click: None,
         };
-        // Seed through the same helper `create` uses, so this asserts the real
+        // Seed through the same method `create` uses, so this asserts the real
         // registration path rather than a test-only shortcut.
-        seed_host_state(&inner, &config);
+        inner.seed_from_config(&config);
         let mut state = TrayShared::from_config(&config);
         state.host = Some(Arc::clone(&inner));
         state.sync_from();
@@ -2813,7 +2992,7 @@ mod tests {
             on_click: None,
             on_double_click: None,
         };
-        seed_host_state(&inner, &config);
+        inner.seed_from_config(&config);
         let mut state = TrayShared::from_config(&config);
         state.host = Some(Arc::clone(&inner));
 
@@ -2919,6 +3098,70 @@ mod tests {
                 .expect("a degraded worker is not an error"),
             Some("no watcher".to_string())
         );
+    }
+
+    #[test]
+    fn a_missing_watcher_is_classified_as_unreachable_not_rejected() {
+        // zbus builds proxies lazily, so a watcher that is not running answers
+        // the registration call itself with ServiceUnknown/NameHasNoOwner; a
+        // watcher that only implements the KDE interface answers
+        // UnknownInterface/UnknownMethod for the fallback; a stale object path
+        // answers UnknownObject; and an activatable watcher that cannot start
+        // surfaces a Spawn.* error. All of them mean "no usable watcher", not
+        // "the shell refused the item".
+        for name in [
+            "org.freedesktop.DBus.Error.ServiceUnknown",
+            "org.freedesktop.DBus.Error.NameHasNoOwner",
+            "org.freedesktop.DBus.Error.UnknownInterface",
+            "org.freedesktop.DBus.Error.UnknownMethod",
+            "org.freedesktop.DBus.Error.UnknownObject",
+            "org.freedesktop.DBus.Error.Spawn.ExecFailed",
+            "org.freedesktop.DBus.Error.Spawn.ForkFailed",
+            "org.freedesktop.DBus.Error.Spawn.Timeout",
+            "org.freedesktop.DBus.Error.NoReply",
+            "org.freedesktop.DBus.Error.TimedOut",
+            "org.freedesktop.DBus.Error.Timeout",
+        ] {
+            assert!(
+                watcher_error_name_is_unreachable(name),
+                "{name} means no watcher is there"
+            );
+        }
+        // Anything else is a real shell-side refusal and must keep the
+        // "rejected" diagnosis.
+        for name in [
+            "org.freedesktop.DBus.Error.AccessDenied",
+            "org.kde.StatusNotifierWatcher.Error",
+            "org.freedesktop.DBus.Error.Failed",
+        ] {
+            assert!(
+                !watcher_error_name_is_unreachable(name),
+                "{name} is a refusal, not an absent watcher"
+            );
+        }
+        // A transport failure never reached a watcher's answer: it is fatal to
+        // the exported item, not a degraded registration and not a rejection.
+        assert!(!watcher_error_is_unreachable(&zbus::Error::Handshake(
+            "test".to_string()
+        )));
+        assert!(watcher_error_is_fatal(&zbus::Error::Handshake(
+            "test".to_string()
+        )));
+        for name in [
+            "org.freedesktop.DBus.Error.Disconnected",
+            "org.freedesktop.DBus.Error.IOError",
+            "org.freedesktop.DBus.Error.NoServer",
+            "org.freedesktop.DBus.Error.NoNetwork",
+        ] {
+            assert!(
+                watcher_error_name_is_fatal(name),
+                "{name} invalidates the exported item"
+            );
+            assert!(
+                !watcher_error_name_is_unreachable(name),
+                "{name} is not a degraded watcher answer"
+            );
+        }
     }
 
     #[test]

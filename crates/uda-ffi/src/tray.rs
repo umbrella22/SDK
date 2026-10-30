@@ -107,15 +107,23 @@ pub const UDA_TRAY_CAP_ICON: u32 = 1 << 8;
 /// Capability bit: the tray exposes hover text.
 pub const UDA_TRAY_CAP_TOOLTIP: u32 = 1 << 9;
 /// Capability bit: the tray reports a single primary click.
+///
+/// Reserved: the C ABI has no click-callback registration, so
+/// `uda_tray_capabilities` always clears this bit. It stays defined for a
+/// future click API; do not infer click events from the bitmask today.
 pub const UDA_TRAY_CAP_CLICK: u32 = 1 << 10;
 /// Capability bit: the tray reports a native double click (never true on Linux
 /// SNI, where it would have to be synthesised).
+///
+/// Reserved for the same reason as [`UDA_TRAY_CAP_CLICK`]: the C ABI cannot
+/// register a click callback, so `uda_tray_capabilities` always clears it.
 pub const UDA_TRAY_CAP_DOUBLE_CLICK: u32 = 1 << 11;
 /// Capability bit: the tray exposes a context menu.
 pub const UDA_TRAY_CAP_CONTEXT_MENU: u32 = 1 << 12;
 /// Capability bit: menu rows can render a checkbox state.
 pub const UDA_TRAY_CAP_CHECKBOX: u32 = 1 << 13;
-/// Capability bit: menu rows can be added, removed or relabelled at runtime.
+/// Capability bit: menu rows can be added at runtime; the C ABI does not
+/// expose removal or relabelling (the Rust core supports both).
 pub const UDA_TRAY_CAP_DYNAMIC_MENU: u32 = 1 << 14;
 
 /// Support-level code: the backend never claimed a tray at all.
@@ -434,8 +442,8 @@ impl TrayRegistry {
     /// never be a use-after-free.
     fn remove_menu(&self, handle: u64) -> Result<Arc<TrayMenu>, Failure> {
         let mut entries = self.lock();
-        let menu = match entries.get(&handle) {
-            Some(TrayEntry::Menu { menu, .. }) => Arc::clone(menu),
+        let (menu, callbacks) = match entries.get(&handle) {
+            Some(TrayEntry::Menu { menu, callbacks }) => (Arc::clone(menu), Arc::clone(callbacks)),
             // Only a peek: a mis-typed call must leave the record untouched,
             // exactly like every other registry lookup.
             Some(TrayEntry::Icon(_)) => return Err(wrong_kind(handle, "tray icon", "menu")),
@@ -450,10 +458,6 @@ impl TrayRegistry {
         // once the in-flight callback returned. Waiting inside `close` would
         // deadlock the host thread against the tray worker - including when
         // the callback destroys its own menu.
-        let callbacks = match entries.get(&handle) {
-            Some(TrayEntry::Menu { callbacks, .. }) => Arc::clone(callbacks),
-            _ => unreachable!("the same lock pass matched this entry above"),
-        };
         callbacks.close()?;
 
         // Detach while the record is still in the table and the lock is still

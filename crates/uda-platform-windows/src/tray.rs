@@ -35,6 +35,7 @@ use std::marker::PhantomPinned;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
@@ -177,6 +178,14 @@ fn to_fixed_utf16<const N: usize>(text: &str) -> [u16; N] {
         }
         buffer[written] = unit;
         written += 1;
+    }
+    // A cut between the two units of a surrogate pair would leave a lone high
+    // surrogate in the buffer, which the Windows shell must never receive. Drop
+    // it; the buffer is already zero-initialised, so the terminator moves in.
+    if written > 0 && (0xD800..=0xDBFF).contains(&buffer[written - 1]) {
+        written -= 1;
+        buffer[written] = 0;
+        log::debug!("tray tip truncated before a surrogate pair");
     }
     buffer
 }
@@ -1018,10 +1027,29 @@ struct Worker {
     menu_tracking: Arc<AtomicBool>,
     /// The address published in GWLP_USERDATA must never move.
     _pin: PhantomPinned,
-    /// Whether the shell has acknowledged `NIM_SETVERSION`.
-    version_handshake_done: bool,
     /// Whether the icon was registered and still needs unregistering.
     registered: bool,
+    /// A refused version handshake could not be undone with `NIM_DELETE`, so
+    /// the shell may still show the item. The sync tick retries the deletion
+    /// before attempting a fresh `NIM_ADD`; `registered` stays true meanwhile.
+    delete_pending: bool,
+    /// When to retry `NIM_ADD` after a failed registration recovery.
+    ///
+    /// `registered` is cleared when the shell restarts and is only set again by
+    /// a successful [`Worker::add_icon`]. The sync tick owns the retry (nothing
+    /// else would bring the item back), and this deadline keeps it from trying
+    /// on every 200 ms tick while the new shell is still coming up.
+    registration_retry_at: Option<Instant>,
+    /// The icon source that last failed to decode, and when to retry it.
+    ///
+    /// A failed source is deliberately not recorded as applied, so a success is
+    /// still picked up and retried. Recording the failure separately spaces the
+    /// retries out: without it `on_tick` would re-read the file, log twice and
+    /// issue a `NIM_MODIFY` every tick for as long as the file stays broken.
+    icon_failure: Option<(TrayIconSource, Instant)>,
+    /// Current backoff for [`Worker::icon_failure`], doubling up to
+    /// [`ICON_RETRY_MAX`].
+    icon_retry_delay: Duration,
     /// Tooltip applied by the last successful update.
     ///
     /// Cached so the sync tick can tell "the host changed the tooltip" from
@@ -1032,6 +1060,14 @@ struct Worker {
     /// Named separately from [`Worker::icon`] (the live `HICON`): one is the
     /// host's declaration, the other is the shell-side handle built from it.
     last_icon: Option<TrayIconSource>,
+    /// Whether [`Worker::icon`] was built from [`Worker::last_icon`].
+    ///
+    /// A hidden item can adopt a new source without a handle being built (it
+    /// draws nothing), so `last_icon` may name a source the live handle does
+    /// not represent. `apply_refresh` reuses the live handle only when this
+    /// flag says the two agree; otherwise showing the item would re-submit the
+    /// previous source.
+    icon_handle_matches: bool,
     /// Menu applied by the last successful update.
     menu: Option<Arc<uda_core::tray::TrayMenu>>,
     /// Visibility applied by the last successful update.
@@ -1061,10 +1097,14 @@ impl Default for Worker {
             menu_table: MenuTable::new(),
             menu_tracking: Arc::new(AtomicBool::new(false)),
             _pin: PhantomPinned,
-            version_handshake_done: false,
             registered: false,
+            delete_pending: false,
+            registration_retry_at: None,
+            icon_failure: None,
+            icon_retry_delay: ICON_RETRY_INITIAL,
             tooltip: String::new(),
             last_icon: None,
+            icon_handle_matches: true,
             menu: None,
             // A new icon is visible until the host hides it; `TrayShared` seeds
             // the same value so the first tick is not mistaken for a change.
@@ -1083,6 +1123,20 @@ const SYNC_INTERVAL_MS: u32 = 200;
 
 /// The timer id used for the sync timer.
 const SYNC_TIMER_ID: usize = 1;
+
+/// First delay before retrying a tray icon source that failed to decode.
+const ICON_RETRY_INITIAL: Duration = Duration::from_secs(5);
+
+/// Ceiling for the icon retry delay: a source that stays broken is retried
+/// once a minute, not on every sync tick.
+const ICON_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Delay before retrying `NIM_ADD` after a failed registration recovery.
+///
+/// [`Worker::on_taskbar_created`] tries once immediately; if the new shell is
+/// still coming up, the sync tick retries on this cadence until the item is
+/// back.
+const REGISTRATION_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 impl Worker {
     /// Register the class, create the window and add the tray icon.
@@ -1195,7 +1249,10 @@ impl Worker {
     ///
     /// `NIM_ADD` first, then `NIM_SETVERSION`: the shell needs an item to
     /// version, and without the handshake it silently falls back to the Windows
-    /// 95 callback behaviour (`tray_specs.md` §2.2).
+    /// 95 callback behaviour (`tray_specs.md` §2.2). Because this worker parses
+    /// every callback as version 4, a refused handshake is fatal: the item is
+    /// removed again and the error is reported, rather than leaving an icon
+    /// whose clicks and menus can never be delivered.
     ///
     /// # Safety
     /// Same contract as [`Worker::setup`]: `worker` points at the pinned owner;
@@ -1210,10 +1267,11 @@ impl Worker {
         data.uCallbackMessage = CALLBACK_MESSAGE;
 
         // SAFETY: `shared` is an `Arc` clone; the borrow ends before the calls.
-        let (tip, icon) = {
+        let (tip, icon_source, icon) = {
             let shared = lock_or_recover(&unsafe { &*worker }.shared, "worker add icon");
             (
                 to_fixed_utf16::<128>(&uda_core::tray::sanitize_tooltip(&shared.tooltip)),
+                shared.icon.clone(),
                 shared
                     .icon
                     .as_ref()
@@ -1254,10 +1312,19 @@ impl Worker {
             // Only now is the item really registered, which is what lets
             // `teardown` decide whether a `NIM_DELETE` is owed at all.
             (*worker).registered = true;
+            (*worker).delete_pending = false;
+            // Registration rebuilt the handle from the mirror, so the cache
+            // only still describes it when both name the same source.
+            (*worker).icon_handle_matches = !icon.is_invalid()
+                && icons_equal(icon_source.as_ref(), (*worker).last_icon.as_ref());
         }
 
-        // Version handshake. A failure is not fatal: the shell keeps using the
-        // legacy callback behaviour, which still delivers clicks.
+        // Version handshake. Callbacks are always parsed as version 4 (the icon
+        // id arrives in the high word of `lParam`), so a shell that refuses the
+        // handshake would deliver every event to the wrong item: only icon id 0
+        // would ever match, and every other icon would silently lose its clicks
+        // and menus. A mute icon is worse than an honest create failure, so the
+        // registration is torn down rather than left in the tray.
         let mut version = data;
         // SAFETY: `uVersion` and `uTimeout` share the anonymous union, and
         // `uFlags` does not select either, so writing one is exactly the
@@ -1265,10 +1332,53 @@ impl Worker {
         version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
         // SAFETY: same struct, still owned by this frame.
         let handed = unsafe { Shell_NotifyIconW(NIM_SETVERSION, &version) };
-        // SAFETY: plain field write after the call returned.
-        unsafe { (*worker).version_handshake_done = handed.as_bool() };
         if !handed.as_bool() {
-            log::debug!("NIM_SETVERSION was not acknowledged; using legacy callbacks");
+            log::warn!(
+                "Shell_NotifyIconW(NIM_SETVERSION) failed; the shell rejects \
+                 NOTIFYICON_VERSION_4, so tray callbacks cannot be delivered"
+            );
+            // Undo the registration. `NIM_DELETE` needs only the window and the
+            // id; whether the handle may be freed depends on whether the shell
+            // actually forgot the item.
+            let mut delete = NOTIFYICONDATAW::default();
+            delete.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+            delete.hWnd = hwnd;
+            delete.uID = icon_id;
+            // SAFETY: same window and id as the `NIM_ADD` that just succeeded;
+            // no `Worker` reference is held across the shell call.
+            let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &delete) };
+            if removed.as_bool() {
+                // The item is gone, so the handle has no remaining user. Clear
+                // both fields before the destroy so `teardown` cannot delete
+                // either one a second time.
+                // SAFETY: plain field writes before the handle is freed;
+                // nothing else refers to it after this point.
+                unsafe {
+                    (*worker).registered = false;
+                    (*worker).delete_pending = false;
+                    (*worker).icon = HICON::default();
+                    (*worker).icon_handle_matches = false;
+                }
+                destroy_icon(icon);
+            } else {
+                // The shell may still be displaying the item. Keep it marked
+                // registered and keep the handle alive: destroying it here
+                // would leave a ghost icon pointing at a freed HICON. The tick
+                // retries the deletion before attempting a fresh registration.
+                unsafe {
+                    (*worker).registered = true;
+                    (*worker).delete_pending = true;
+                }
+                log::debug!(
+                    "Shell_NotifyIconW(NIM_DELETE) after a refused version handshake \
+                     failed; the tick will retry the deletion"
+                );
+            }
+            return Err(UdaError::Internal(
+                "the shell rejected NOTIFYICON_VERSION_4, so tray callbacks cannot be delivered; \
+                 refusing to register an icon that cannot be clicked"
+                    .to_string(),
+            ));
         }
 
         Ok(())
@@ -1283,6 +1393,10 @@ impl Worker {
     /// (`tooltip`, `last_icon`, `visible`) are rewritten **only on success**,
     /// so a failed update leaves them stale and the next tick retries it
     /// instead of recording a change as applied that the shell never saw.
+    /// `last_icon` additionally stays stale when the new source could not be
+    /// decoded, so that failure is retried too - on the backoff recorded in
+    /// `icon_failure` rather than on every tick, so a broken file is not
+    /// re-read and re-warned every 200 ms.
     ///
     /// # Safety
     /// Same contract as [`Worker::setup`]: `worker` points at the pinned owner;
@@ -1307,12 +1421,100 @@ impl Worker {
         data.uCallbackMessage = CALLBACK_MESSAGE;
         data.szTip = to_fixed_utf16::<128>(&uda_core::tray::sanitize_tooltip(&tooltip));
 
+        // Resolve the source before the visibility branch so the cache written
+        // below records only what the shell can actually show. A missing file
+        // or an unsupported format must leave `last_icon` stale: recording the
+        // failed source as applied would stop a later retry and make
+        // `set_icon` look like it succeeded.
+        //
+        // Two short-circuits avoid touching the file system at all: a source
+        // already applied to the live handle is reused for tooltip refreshes,
+        // and a source recorded in `icon_failure` is skipped until its retry
+        // deadline. A hidden item decodes nothing: the handle is not shown, so
+        // the source is recorded and decoded when the item is shown again.
+        let now = Instant::now();
+        // SAFETY: short reads; the borrow ends before the shell call.
+        let (applied_source, applied_handle_matches, failure) = unsafe {
+            (
+                (*worker).last_icon.clone(),
+                (*worker).icon_handle_matches,
+                (*worker).icon_failure.clone(),
+            )
+        };
+        // SAFETY: short read.
+        let retry_delay = unsafe { (*worker).icon_retry_delay };
         let mut new_icon = applied_icon;
+        let mut icon_source_applied = icon_source.is_none();
+        let mut source_decoded = icon_source.is_none();
+        let mut handle_matches = icon_source.is_none() || applied_handle_matches;
+        if let Some(source) = icon_source.as_ref() {
+            let in_backoff = matches!(
+                failure.as_ref(),
+                Some((failed, retry_at)) if failed == source && now < *retry_at
+            );
+            if in_backoff {
+                // Not due yet: keep the applied icon and leave the source
+                // unrecorded, so the failure is retried when the deadline
+                // passes.
+            } else if !visible {
+                // Nothing is drawn while hidden, so decoding now would build a
+                // handle only to release it. Record the source so a tooltip
+                // refresh does not keep re-reading it; the show path decodes it
+                // because the applied handle still belongs to the previous
+                // source.
+                icon_source_applied = true;
+                if !icons_equal(Some(source), applied_source.as_ref()) {
+                    // No handle was built for this source, so the live one no
+                    // longer matches the recorded source.
+                    handle_matches = false;
+                }
+            } else if applied_handle_matches && icons_equal(Some(source), applied_source.as_ref()) {
+                // The live handle was built from this exact source, so
+                // rebuilding it would only re-read and re-decode the file.
+                icon_source_applied = true;
+                handle_matches = true;
+            } else {
+                match icon_from_source(source) {
+                    Some(icon) => {
+                        new_icon = icon;
+                        icon_source_applied = true;
+                        source_decoded = true;
+                        handle_matches = true;
+                    }
+                    None => {
+                        // Warn once per distinct source; a source that keeps
+                        // failing is retried at debug level so a broken file
+                        // does not flood the log every 200 ms.
+                        let source_changed = !matches!(
+                            failure.as_ref(),
+                            Some((failed, _)) if failed == source
+                        );
+                        if source_changed {
+                            log::warn!(
+                                "tray icon source could not be decoded; keeping the previous \
+                                 icon and retrying in {retry_delay:?}"
+                            );
+                        } else {
+                            log::debug!(
+                                "tray icon source still cannot be decoded; next retry in \
+                                 {retry_delay:?}"
+                            );
+                        }
+                        // Record the failure and double the backoff up to the
+                        // ceiling. `last_icon` stays stale, so a source that
+                        // recovers is picked up by the next due retry.
+                        // SAFETY: plain field writes; no shell call in between.
+                        unsafe {
+                            (*worker).icon_failure = Some((source.clone(), now + retry_delay));
+                            (*worker).icon_retry_delay = (retry_delay * 2).min(ICON_RETRY_MAX);
+                        }
+                    }
+                }
+            }
+        }
+
         let mut flags = BASE_ICON_FLAGS;
         if visible {
-            if let Some(source) = icon_source.as_ref() {
-                new_icon = icon_from_source(source).unwrap_or(applied_icon);
-            }
             if !new_icon.is_invalid() {
                 flags |= NIF_ICON;
                 data.hIcon = new_icon;
@@ -1326,7 +1528,10 @@ impl Worker {
             data.dwStateMask = NIS_HIDDEN;
         } else {
             // A hidden icon keeps its registration but is not drawn, which is
-            // the documented alternative to unregistering and re-adding.
+            // the documented alternative to unregistering and re-adding. No
+            // handle is decoded in this branch, so the applied icon stays the
+            // one the shell already knows; the source recorded above is decoded
+            // when the item is shown again.
             flags |= NIF_STATE;
             data.dwState = NIS_HIDDEN;
             data.dwStateMask = NIS_HIDDEN;
@@ -1340,9 +1545,9 @@ impl Worker {
         let updated = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
         if !updated.as_bool() {
             log::debug!("Shell_NotifyIconW(NIM_MODIFY) failed; keeping the previous state");
-            // A freshly built handle must not leak — but it may legitimately be
-            // the still-registered one (`unwrap_or(applied_icon)` above), which
-            // has to survive a failed update.
+            // A freshly built handle must not leak - but `new_icon` starts as
+            // the still-registered handle, which has to survive a failed
+            // update.
             if !new_icon.is_invalid() && new_icon != applied_icon {
                 destroy_icon(new_icon);
             }
@@ -1358,12 +1563,29 @@ impl Worker {
         }
         // Record exactly what the shell now shows, so the next tick compares
         // against reality rather than against intent (and retries a failed
-        // update because the cache still holds the old value).
+        // update because the cache still holds the old value). The icon source
+        // is recorded only when it decoded, when it is `None` (no conversion
+        // needed), or when the item is hidden (nothing is drawn, and the show
+        // path decodes it); a failed conversion keeps the previous source,
+        // which makes the mirror differ from the cache on the next tick and
+        // retries the load.
         // SAFETY: plain field writes after the call returned.
         unsafe {
             (*worker).tooltip = tooltip;
-            (*worker).last_icon = icon_source;
+            if icon_source_applied {
+                (*worker).last_icon = icon_source;
+            }
             (*worker).visible = visible;
+            (*worker).icon_handle_matches = handle_matches;
+        }
+        if source_decoded {
+            // A working source ends the backoff; a later failure of the same
+            // source starts over at the initial delay.
+            // SAFETY: plain field writes after the shell accepted the update.
+            unsafe {
+                (*worker).icon_failure = None;
+                (*worker).icon_retry_delay = ICON_RETRY_INITIAL;
+            }
         }
         true
     }
@@ -1402,6 +1624,100 @@ impl Worker {
             return false;
         }
 
+        // A refused version handshake that could not be undone leaves the shell
+        // item in place with `registered = true`. Retry the deletion first;
+        // calling `NIM_ADD` again while the item still exists cannot succeed.
+        // A stale pending flag with `registered = false` belongs to the re-add
+        // path instead (for example after a TaskbarCreated reset).
+        let delete_pending = unsafe { (*worker).delete_pending };
+        let registered = unsafe { (*worker).registered };
+        if delete_pending && registered {
+            let now = Instant::now();
+            // SAFETY: short field read.
+            let retry_due = unsafe { (*worker).registration_retry_at }.is_none_or(|at| now >= at);
+            if retry_due {
+                // SAFETY: short field reads; the shell call below holds no
+                // `Worker` reference.
+                let (hwnd, icon_id) = unsafe { ((*worker).hwnd, (*worker).icon_id) };
+                let mut data = NOTIFYICONDATAW::default();
+                data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
+                data.hWnd = hwnd;
+                data.uID = icon_id;
+                // SAFETY: same window and id as the registration that could
+                // not complete its version handshake.
+                let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
+                if removed.as_bool() {
+                    // SAFETY: the shell forgot the item, so the HICON has no
+                    // remaining user and can be freed.
+                    let icon = unsafe { (*worker).icon };
+                    unsafe {
+                        (*worker).registered = false;
+                        (*worker).delete_pending = false;
+                        (*worker).registration_retry_at = None;
+                        (*worker).icon = HICON::default();
+                    }
+                    destroy_icon(icon);
+                    // The next tick can add a fresh icon; skip refreshing an
+                    // item the shell just removed.
+                    return true;
+                }
+                log::debug!(
+                    "tray deletion is still pending; retrying in \
+                     {REGISTRATION_RETRY_DELAY:?}"
+                );
+                // SAFETY: plain field write.
+                unsafe {
+                    (*worker).registration_retry_at = Some(now + REGISTRATION_RETRY_DELAY);
+                }
+            }
+            // While the stale item is being removed there is nothing usable to
+            // refresh.
+            return true;
+        }
+
+        // A shell restart clears `registered`, and the immediate re-add in
+        // `on_taskbar_created` can fail while the new shell is still starting.
+        // `NIM_MODIFY` can never bring the item back, so the tick owns a
+        // backed-off retry; otherwise the icon would stay missing until the
+        // next `TaskbarCreated`. A failed NIM_DELETE after a refused version
+        // handshake leaves `registered` true but records a retry deadline, so
+        // either signal is enough to enter the recovery path.
+        // SAFETY: short field reads.
+        let registered = unsafe { (*worker).registered };
+        let retry_pending = unsafe { (*worker).registration_retry_at.is_some() };
+        if !registered || retry_pending {
+            let now = Instant::now();
+            // SAFETY: short field read.
+            let retry_due = unsafe { (*worker).registration_retry_at }.is_none_or(|at| now >= at);
+            if retry_due {
+                // SAFETY: raw entry - no borrow survives into the shell call.
+                match unsafe { Self::add_icon(worker) } {
+                    Ok(()) => {
+                        // SAFETY: plain field write after the shell accepted.
+                        unsafe { (*worker).registration_retry_at = None };
+                        if !visible {
+                            // `add_icon` registers the icon shown; make the
+                            // applied cache say so, so the refresh below sees
+                            // the hidden mirror as a change and re-applies
+                            // `NIS_HIDDEN`.
+                            // SAFETY: plain field write.
+                            unsafe { (*worker).visible = true };
+                        }
+                    }
+                    Err(error) => {
+                        log::debug!(
+                            "tray icon re-registration failed; retrying in \
+                             {REGISTRATION_RETRY_DELAY:?}: {error}"
+                        );
+                        // SAFETY: plain field write.
+                        unsafe {
+                            (*worker).registration_retry_at = Some(now + REGISTRATION_RETRY_DELAY);
+                        }
+                    }
+                }
+            }
+        }
+
         // One refresh covers visibility, tooltip and icon together; whether the
         // mirror differs from what the shell last accepted decides whether a
         // `NIM_MODIFY` is worth issuing. `apply_refresh` rewrites its caches
@@ -1415,9 +1731,22 @@ impl Worker {
                 (*worker).last_icon.clone(),
             )
         };
+        let icon_differs = !icons_equal(icon.as_ref(), applied_icon_source.as_ref());
+        // A source in decode backoff cannot change the icon until its retry is
+        // due, so it alone does not justify a refresh. Tooltip and visibility
+        // differences still do; `apply_refresh` skips just the decode then.
+        // SAFETY: short read of the failure cache; no shell call in between.
+        let icon_in_backoff = unsafe {
+            match ((*worker).icon_failure.as_ref(), icon.as_ref()) {
+                (Some((failed, retry_at)), Some(source)) => {
+                    failed == source && Instant::now() < *retry_at
+                }
+                _ => false,
+            }
+        };
         if visible != applied_visible
             || tooltip != applied_tooltip
-            || !icons_equal(icon.as_ref(), applied_icon_source.as_ref())
+            || (icon_differs && !icon_in_backoff)
         {
             // SAFETY: raw entry - no borrow survives into the shell call.
             unsafe { Self::apply_refresh(worker) };
@@ -1552,6 +1881,11 @@ impl Worker {
     /// reference alive: a host callback that pumps messages re-enters the
     /// window procedure through its own pointer access instead of aliasing.
     ///
+    /// The invocation goes through `catch_unwind`: this runs inside an
+    /// `unsafe extern "system"` window procedure, and a host panic crossing
+    /// that boundary aborts the process. The handler is restored after the
+    /// call on both the normal and the panicking path.
+    ///
     /// # Safety
     /// `worker` points at the pinned owner on this thread.
     unsafe fn dispatch(worker: *mut Self, event: TrayEvent) {
@@ -1565,7 +1899,18 @@ impl Worker {
             }
         };
         if let Some(mut handler) = handler {
-            handler(&event);
+            // This runs inside an `unsafe extern "system"` window procedure: a
+            // host panic must not cross the FFI boundary, which aborts the
+            // process. It is caught and logged instead, and the handler is put
+            // back on both the normal and the panicking path - unlike the old
+            // code, which restored it only on a normal return and permanently
+            // lost it after a panic.
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handler(&event);
+            }));
+            if outcome.is_err() {
+                log::warn!("tray event handler panicked; it stays registered");
+            }
             let mut shared = lock_or_recover(&shared, "dispatch restore");
             match event {
                 TrayEvent::Click => shared.on_click = Some(handler),
@@ -1695,8 +2040,9 @@ impl Worker {
     ///
     /// explorer.exe forgets every notification-area item when it (re)starts; the
     /// worker re-adds the icon from its mirrored state. A refusal is not fatal:
-    /// the next `TaskbarCreated` or the sync tick still sees a consistent
-    /// worker.
+    /// the registration flag stays cleared and the sync tick retries `NIM_ADD`
+    /// on a bounded backoff until the icon is back (or the next
+    /// `TaskbarCreated` supersedes the attempt).
     ///
     /// # Safety
     /// `worker` points at the pinned owner on this thread; the shell calls run
@@ -1708,15 +2054,27 @@ impl Worker {
             return;
         }
         log::debug!("shell restarted; re-registering the tray icon");
-        // explorer forgot the item, so the local flag must be cleared before
-        // the re-add: `add_icon` sets it again only on success.
-        // SAFETY: plain field write before the re-registration call.
-        unsafe { (*worker).registered = false };
+        // explorer forgot every item, including one whose deletion was still
+        // pending, so all recovery state resets before the re-add: `add_icon`
+        // sets `registered` again only on success, and a stale `delete_pending`
+        // must not block the `NIM_ADD` retry on the next tick.
+        // SAFETY: plain field writes before the re-registration call.
+        unsafe {
+            (*worker).registered = false;
+            (*worker).delete_pending = false;
+            (*worker).registration_retry_at = None;
+        }
         // SAFETY: raw entry; no borrow survives into the shell round-trip.
         if let Err(error) = unsafe { Self::add_icon(worker) } {
             log::warn!("could not re-register the tray icon after a shell restart: {error}");
+            // SAFETY: plain field write; the shell call already returned.
+            unsafe {
+                (*worker).registration_retry_at = Some(Instant::now() + REGISTRATION_RETRY_DELAY);
+            }
             return;
         }
+        // SAFETY: plain field write; the shell call already returned.
+        unsafe { (*worker).registration_retry_at = None };
         // SAFETY: short field read.
         if !unsafe { (*worker).visible } {
             // `add_icon` registers the icon shown. Flip the applied cache back
@@ -1772,9 +2130,17 @@ impl Worker {
                 action
             }
         };
-        // The invocation is the only out-call here and runs borrow-free.
+        // The invocation is the only out-call here and runs borrow-free. Host
+        // code is invoked from the window procedure, so a panic is caught
+        // rather than allowed to unwind across the FFI boundary (which aborts
+        // the process); the menu stays attached and later clicks still work.
         if let Some(action) = action {
-            action.invoke(&TrayEvent::Click);
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                action.invoke(&TrayEvent::Click);
+            }));
+            if outcome.is_err() {
+                log::warn!("tray menu action panicked; the command was dropped");
+            }
         }
     }
 
@@ -1806,6 +2172,10 @@ impl Worker {
     unsafe fn teardown(worker: *mut Self) {
         // SAFETY: short field read; the handle stays valid until DestroyWindow.
         let hwnd = unsafe { (*worker).hwnd };
+        // Whether the shell actually forgot the item. Only then is the HICON
+        // safe to destroy; a failed NIM_DELETE leaves the handle allocated on
+        // purpose (the window is about to die, so there is no later retry).
+        let mut delete_succeeded = true;
         // Stop the heartbeat first: no tick may fire while the icon is being
         // unregistered, or it would try to refresh an item mid-deletion. The
         // timer is killed whenever the window exists (not only on a successful
@@ -1823,6 +2193,7 @@ impl Worker {
             // the shell may have recycled for another item.
             // SAFETY: short field read.
             let registered = unsafe { (*worker).registered };
+            delete_succeeded = !registered;
             if registered {
                 let mut data = NOTIFYICONDATAW::default();
                 data.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
@@ -1832,21 +2203,34 @@ impl Worker {
                 // SAFETY: same window and id as registration; the shell forgets
                 // the item immediately, so no other field has to be filled.
                 let removed = unsafe { Shell_NotifyIconW(NIM_DELETE, &data) };
-                if !removed.as_bool() {
-                    log::debug!("Shell_NotifyIconW(NIM_DELETE) reported a failure");
+                delete_succeeded = removed.as_bool();
+                if !delete_succeeded {
+                    log::warn!(
+                        "Shell_NotifyIconW(NIM_DELETE) failed at teardown; leaving the HICON \
+                         allocated so a shell item that still references it cannot point at \
+                         freed memory"
+                    );
+                    // Clear the field without calling DestroyIcon: a second
+                    // teardown (the function is documented as idempotent) must
+                    // not free the handle the shell may still reference.
+                    // SAFETY: plain field write; the handle value is dropped.
+                    unsafe { (*worker).icon = HICON::default() };
                 }
-                // Either way the item is gone from this worker's point of view;
-                // a second teardown must not try again.
+                // Either way this worker's teardown is finished; a second
+                // teardown must not try again. The HICON is only freed below
+                // when the shell proved it no longer holds the item.
                 // SAFETY: plain field write after the call returned.
                 unsafe { (*worker).registered = false };
             }
         }
 
-        // SAFETY: short field read.
-        let icon = unsafe { (*worker).icon };
-        destroy_icon(icon);
-        // SAFETY: plain field write.
-        unsafe { (*worker).icon = HICON::default() };
+        if delete_succeeded {
+            // SAFETY: short field read.
+            let icon = unsafe { (*worker).icon };
+            destroy_icon(icon);
+            // SAFETY: plain field write.
+            unsafe { (*worker).icon = HICON::default() };
+        }
 
         if !hwnd.is_invalid() {
             // SAFETY: this thread created the window and owns its message loop.
@@ -2217,6 +2601,12 @@ impl TrayManager for WindowsTrayManager {
     fn create(&self, config: TrayIconConfig) -> Result<TrayIcon, UdaError> {
         let inner = Arc::new(uda_core::tray::TrayIconInner::new(config.name.clone()));
         let icon = TrayIcon::from_inner(Arc::clone(&inner));
+
+        // Seed the host-visible state from the registration request, exactly as
+        // the Linux backend does. The worker's first tick mirrors this state, so
+        // without it the empty `TrayIconInner` would overwrite the mirror on the
+        // first refresh and clear the tooltip/icon/menu the host passed here.
+        inner.seed_from_config(&config);
 
         // The callbacks cannot be cloned, so they are moved out of the config
         // before it is consumed; this is the only chance to take them.

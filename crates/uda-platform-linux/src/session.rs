@@ -56,9 +56,12 @@
 //!
 //! # Timeouts
 //!
-//! Every D-Bus await is wrapped in `DBUS_TIMEOUT`, so a logind that is
-//! installing an update (and therefore not answering) costs a bounded wait
-//! instead of a hung caller.
+//! Every D-Bus await is wrapped in `DBUS_TIMEOUT`, and the four independent
+//! receiver probes run concurrently. The logind session lookup starts only
+//! after the presence answer arrives, so the worst-case first capability call
+//! is the presence probe plus the session lookup (about 35 seconds in the worst
+//! case), not four serial waits; a receiver that fails or times out loses only
+//! its own result.
 //!
 //! See `docs/internals/session_specs.md` for the full mapping.
 
@@ -536,42 +539,97 @@ struct SessionReachability {
 }
 
 /// Probe once per process; failures leave only the affected receiver absent.
+///
+/// Every receiver is independent, so they are all probed concurrently and every
+/// underlying D-Bus await is bounded by `DBUS_TIMEOUT`. The logind session
+/// lookup is gated on the presence answer, so the first
+/// [`SessionManager::capabilities`] call pays the presence probe plus the
+/// session lookup in the worst case (about 35 seconds), not four serial waits;
+/// a receiver that fails or times out loses only its own result.
 fn session_reachability() -> SessionReachability {
     static REACHABLE: OnceLock<SessionReachability> = OnceLock::new();
-    *REACHABLE.get_or_init(|| {
-        let logind = probe_reachable(crate::sync::run_async(logind_present()), "logind");
-        let (lock_auto, logout_self) = if logind {
-            match crate::sync::run_async(logind_sessions_present()) {
-                Ok(Ok(sessions)) => sessions,
-                Ok(Err(error)) | Err(error) => {
-                    log::debug!("logind session probes did not answer: {error}");
-                    (false, false)
-                }
-            }
-        } else {
-            (false, false)
-        };
-        let desktop_logout = !logout_self
-            && probe_reachable(
-                crate::sync::run_async(desktop_logout_manager_present()),
-                "desktop logout managers",
-            );
-        let screen_saver = probe_reachable(
-            crate::sync::run_async(screensaver_present()),
-            "screen saver",
-        );
-        SessionReachability {
-            logind,
-            lock_auto,
-            logout_self,
-            screen_saver,
-            desktop_logout,
+    *REACHABLE.get_or_init(|| match crate::sync::run_async(probe_receivers()) {
+        Ok(reachability) => reachability,
+        Err(error) => {
+            // The bridge itself could not run the probes; every receiver
+            // stays unclaimed rather than guessing.
+            log::debug!("the session reachability probes could not run: {error}");
+            SessionReachability::default()
         }
     })
 }
 
+/// Run the four receiver probes concurrently and compose the same verdict the
+/// former sequential probe produced.
+///
+/// The session queries are gated on the actual logind answer through a one-shot
+/// channel: [`logind_sessions_present`] would otherwise hit the system bus (and
+/// could activate a logind that was not running) even when [`logind_present`]
+/// said there is none. Awaiting the channel does not serialize the other
+/// receivers - they are already in flight. Every underlying D-Bus await keeps
+/// its own `DBUS_TIMEOUT`, so a slow receiver affects only its own result.
+async fn probe_receivers() -> SessionReachability {
+    let (logind_sender, logind_receiver) = tokio::sync::oneshot::channel();
+
+    let logind = async move {
+        let presence = logind_present().await;
+        // Publishes the actual answer, so the session probe never queries a
+        // service that is not running. A dropped receiver is harmless.
+        let _ = logind_sender.send(matches!(presence, Ok(true)));
+        presence
+    };
+    let sessions = async move {
+        match logind_receiver.await {
+            // Only a logind that is really running is asked for its sessions.
+            Ok(true) => logind_sessions_present().await,
+            // Absent, or the logind probe was dropped before answering: there
+            // is no manager to list sessions from.
+            Ok(false) | Err(_) => Ok((false, false)),
+        }
+    };
+
+    // `join!` keeps all four in flight on one task. The presence and session
+    // probes are sequential by design (the latter is gated on the former), but
+    // the logout-manager and screen-saver probes run alongside both.
+    let (logind, sessions, desktop_logout, screen_saver) = tokio::join!(
+        logind,
+        sessions,
+        desktop_logout_manager_present(),
+        screensaver_present(),
+    );
+
+    let logind = reachable_or_absent(logind, "logind");
+    // An absent manager cannot answer the session queries; the gated probe
+    // above already returns `(false, false)` in that case, and a `false`
+    // logind collapses the answer the same way the sequential probe did.
+    let (lock_auto, logout_self) = if logind {
+        match sessions {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                log::debug!("logind session probes did not answer: {error}");
+                (false, false)
+            }
+        }
+    } else {
+        (false, false)
+    };
+    // A desktop logout manager only becomes the logout receiver when the
+    // caller's own session is not reachable, exactly as before.
+    let desktop_logout =
+        !logout_self && reachable_or_absent(desktop_logout, "desktop logout managers");
+    let screen_saver = reachable_or_absent(screen_saver, "screen saver");
+    SessionReachability {
+        logind,
+        lock_auto,
+        logout_self,
+        screen_saver,
+        desktop_logout,
+    }
+}
+
 /// `auto` can use the user's display session; `""` requires the caller's own.
-/// Both probes share a connection and listing, but fail independently.
+/// Both probes share a connection and listing, and are issued concurrently, but
+/// fail independently.
 async fn logind_sessions_present() -> Result<(bool, bool), UdaError> {
     let connection = LinuxSessionManager::system_connection().await?;
     logind_sessions_on(&connection).await
@@ -594,8 +652,12 @@ async fn logind_sessions_on(connection: &Connection) -> Result<(bool, bool), Uda
     if sessions.is_empty() {
         return Ok((false, false));
     }
-    let lock_auto = logind_session_resolves(&proxy, "auto").await;
-    let logout_self = logind_session_resolves(&proxy, "").await;
+    // Both calls share the proxy; each keeps its own `DBUS_TIMEOUT`, and
+    // issuing them together halves the wait when both are slow.
+    let (lock_auto, logout_self) = tokio::join!(
+        logind_session_resolves(&proxy, "auto"),
+        logind_session_resolves(&proxy, ""),
+    );
     Ok((lock_auto, logout_self))
 }
 
@@ -661,17 +723,15 @@ async fn desktop_bus_names(proxy: &zbus::fdo::DBusProxy<'_>, method: &str) -> Ve
     }
 }
 
-/// Collapse a bridged probe into a plain bool.
+/// Collapse a concurrent probe's answer into a plain bool.
 ///
-/// The sync bridge wraps the probe's own `Result`, so there are two failure
-/// layers: the bridge failing to run the future at all, and the probe failing
-/// on the bus. For capability honesty both mean the same thing - "not proven
-/// present" - so both collapse to `false`, matching the wake-lock backend's
-/// fold.
-fn probe_reachable(probe: Result<Result<bool, UdaError>, UdaError>, receiver: &str) -> bool {
+/// A probe that fails on the bus means the same thing as "the receiver is not
+/// proven present", so the error is logged for diagnostics and collapses to
+/// `false`, matching the wake-lock backend's fold.
+fn reachable_or_absent(probe: Result<bool, UdaError>, receiver: &str) -> bool {
     match probe {
-        Ok(Ok(reachable)) => reachable,
-        Ok(Err(error)) | Err(error) => {
+        Ok(reachable) => reachable,
+        Err(error) => {
             log::debug!("the {receiver} reachability probe did not answer: {error}");
             false
         }
@@ -1178,7 +1238,11 @@ mod tests {
                 logind_sessions_on(&client).await.expect("session probes"),
                 (auto, caller_self)
             );
-            assert_eq!(*calls.lock().expect("mock calls lock"), vec!["auto", ""]);
+            // Both `GetSession` calls are issued concurrently, so the recorded
+            // order is not deterministic; compare the set they form instead.
+            let mut recorded = calls.lock().expect("mock calls lock").clone();
+            recorded.sort();
+            assert_eq!(recorded, vec!["", "auto"]);
         }
     }
 
@@ -1436,16 +1500,13 @@ mod tests {
 
     #[test]
     fn a_failed_probe_counts_as_an_absent_receiver() {
-        // Conservative direction: any failure - bridge or bus - collapses to
-        // "not proven present", never to a claim.
-        assert!(probe_reachable(Ok(Ok(true)), "logind"));
-        assert!(!probe_reachable(Ok(Ok(false)), "logind"));
-        assert!(!probe_reachable(
-            Ok(Err(UdaError::DetectionFailed("no bus".to_string()))),
-            "logind"
-        ));
-        assert!(!probe_reachable(
-            Err(UdaError::Internal("no runtime".to_string())),
+        // Conservative direction: any bus failure collapses to "not proven
+        // present", never to a claim. A failure of the sync bridge itself is
+        // collapsed to the same default by `session_reachability`.
+        assert!(reachable_or_absent(Ok(true), "logind"));
+        assert!(!reachable_or_absent(Ok(false), "logind"));
+        assert!(!reachable_or_absent(
+            Err(UdaError::DetectionFailed("no bus".to_string())),
             "logind"
         ));
     }

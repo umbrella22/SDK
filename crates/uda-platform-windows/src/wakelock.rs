@@ -39,11 +39,15 @@ use uda_core::wakelock::{WakeLockGuard, WakeLockManager, WakeLockType};
 /// On drop the thread execution state is restored to the default
 /// `ES_CONTINUOUS`, which releases both the display and system requirements.
 ///
-/// The guard is intentionally not `Clone` and not `Send`-agnostic about ordering:
-/// because the underlying API is thread-scoped, releasing from a different thread
-/// than the one that acquired the lock would not clear the flag on the thread
-/// that actually holds it. It is still `Send` so it can be moved onto the thread
-/// that owns the lock, which is the common case.
+/// The guard is intentionally not `Clone`, but releasing it is
+/// thread-independent: the execution-state flags live on a dedicated owner
+/// thread that [`WindowsWakeLockManager::acquire`] creates, and the guard's
+/// release closure only signals that thread over a channel. Dropping the guard,
+/// or explicitly releasing it through
+/// [`WindowsWakeLockGuard::release`], therefore works from any thread: the
+/// owner thread performs the `SetThreadExecutionState(ES_CONTINUOUS)` reset
+/// itself. The guard is `Send` with no requirement that it return to the
+/// thread it was created on.
 pub struct WindowsWakeLockGuard {
     /// The core RAII guard that actually owns the release closure.
     ///

@@ -30,7 +30,11 @@ impl CapabilityMatrix {
     pub const TRAY_DYNAMIC_MENU: u32 = 1 << 14;
     /// A media playback backend exists (MPRIS v2 on Linux, SMTC on Windows).
     pub const MEDIA_CONTROL: u32 = 1 << 15;
-    /// A session backend exists: at least one of the actions below can be issued.
+    /// The calling user's session can be ended: logind can resolve the caller's
+    /// own session, or a desktop logout manager is reachable.
+    ///
+    /// Power actions (suspend, hibernate, reboot, shutdown) have their own bits
+    /// and do not imply this one.
     pub const SESSION_MANAGEMENT: u32 = 1 << 16;
     /// The session can be locked (the only safe-to-automate action).
     pub const LOCK: u32 = 1 << 17;

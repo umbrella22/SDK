@@ -192,7 +192,7 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
 
 | 函数 | 出参 | 说明 |
 |---|---|---|
-| `uda_session_capabilities(out: *mut u32)` | 能力位掩码 | 无副作用，可随时调用；0 表示无后端 |
+| `uda_session_capabilities(out: *mut u32)` | 能力位掩码 | 无副作用；首次调用可能有界探测，之后使用缓存；0 表示没有任何会话动作接收方可达 |
 | `uda_session_lock()` | 无 | **唯一可自动化的动作** |
 | `uda_session_logout()` | 无 | 危险 |
 | `uda_session_suspend()` | 无 | 危险 |

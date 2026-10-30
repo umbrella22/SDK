@@ -10,11 +10,13 @@
 //! # Safety posture
 //!
 //! Five of the six actions are destructive: they end the user's session or stop
-//! the machine. The model therefore separates
+//! the machine. The model therefore separates the two questions a caller has to
+//! ask, in order:
 //!
 //! - [`SessionManager::capabilities`], which is a *static, side-effect-free*
-//!   query a UI can call freely, from
-//! - the six action methods, each of which performs an irreversible system
+//!   query. On Linux the first call performs one bounded service probe (the
+//!   answer is cached afterwards); later calls are immediate.
+//! - The six action methods, each of which performs an irreversible system
 //!   operation the moment it returns `Ok`.
 //!
 //! A caller is expected to gate the destructive methods behind
@@ -291,10 +293,13 @@ mod tests {
     }
 
     #[test]
-    fn session_management_is_an_umbrella_not_an_action_gate() {
-        // `SESSION_MANAGEMENT` says a backend exists; it must not by itself
-        // authorise any action, or a caller asking only "is there a backend?"
-        // could accidentally power the machine off.
+    fn session_management_is_descriptive_and_gates_no_action() {
+        // `SESSION_MANAGEMENT` reports a fact - the caller's own session can be
+        // ended (logind resolved the caller session, or a desktop logout
+        // manager is reachable) - not an umbrella permission. Each action is
+        // gated by its own bit, so this flag alone must not authorise Lock (or
+        // any other action): a caller asking only "can my session be managed?"
+        // must never trigger one.
         let manager = RecordingManager::with(Capability::SESSION_MANAGEMENT);
 
         assert!(perform(&manager, SessionAction::Lock).is_err());

@@ -80,9 +80,12 @@ pub type TrayEventHandler = Box<dyn FnMut(&TrayEvent) + Send + 'static>;
 /// NUL terminator, so 127 is the safety cap used cross-platform.
 pub const TOOLTIP_MAX_CHARS: usize = 127;
 
-/// Preferred tooltip length. Text longer than this is clamped, and the backend
-/// reports [`SupportLevel::Partial`] with the truncation stated as the reason
-/// rather than clipping silently.
+/// Preferred tooltip length, used by [`tooltip_needs_truncation`] to flag text
+/// that callers may want to shorten; it is advisory only. The only enforced
+/// clamp is [`TOOLTIP_MAX_CHARS`] in [`sanitize_tooltip`], which
+/// [`TrayIcon::set_tooltip`] and the Windows backend apply before submitting a
+/// tooltip; the Linux SNI backend forwards the text as-is. No per-icon
+/// capability reports the truncation.
 pub const TOOLTIP_TARGET_CHARS: usize = 80;
 
 /// Truncate `text` to at most `limit` `char`s without splitting a `char`,
@@ -105,7 +108,12 @@ pub fn sanitize_tooltip(text: &str) -> &str {
     truncate_chars(text, TOOLTIP_MAX_CHARS)
 }
 
-/// Whether `text` exceeds [`TOOLTIP_TARGET_CHARS`] and therefore needs clamping.
+/// Whether `text` is longer than the preferred [`TOOLTIP_TARGET_CHARS`], so a
+/// caller may choose to shorten it for display.
+///
+/// This is a hint, not a guarantee of what is submitted: [`sanitize_tooltip`]
+/// only clamps above [`TOOLTIP_MAX_CHARS`], so text between the two lengths is
+/// passed through unchanged.
 #[must_use]
 pub fn tooltip_needs_truncation(text: &str) -> bool {
     text.chars().count() > TOOLTIP_TARGET_CHARS
@@ -957,8 +965,10 @@ impl TrayIconBuilder {
         self
     }
 
-    /// Tooltip text. Over-long values are clamped by the backend, which then
-    /// reports [`SupportLevel::Partial`] carrying the truncation as its reason.
+    /// Tooltip text. The Windows backend clamps over-long values to
+    /// [`TOOLTIP_MAX_CHARS`] when it submits them, while the Linux SNI backend
+    /// forwards the text as-is; the clamp is silent and is not reflected in
+    /// [`TrayIcon::support_level`].
     #[must_use]
     pub fn tooltip(mut self, tooltip: impl Into<String>) -> Self {
         self.config.tooltip = tooltip.into();
@@ -1160,6 +1170,21 @@ impl TrayIconInner {
                 degraded: None,
             }),
         }
+    }
+
+    /// Seed the host-visible state from a registration request. Backend use
+    /// only: both `create` implementations call this before the icon reaches
+    /// the host, so the host's accessors and the backend's mirror start from
+    /// the same values under one lock.
+    ///
+    /// A freshly registered icon is visible; a later [`TrayIcon::hide`] is what
+    /// changes that.
+    pub fn seed_from_config(&self, config: &TrayIconConfig) {
+        let mut state = self.lock_state();
+        state.tooltip = config.tooltip.clone();
+        state.icon = config.icon.clone();
+        state.menu = config.menu.clone();
+        state.visible = true;
     }
 
     /// Publish what the active backend actually supports. Backend use only;

@@ -138,21 +138,31 @@ property, usually `/MenuBar`.
 | `disposition` | `s` | `"informative"` / `"warning"` / `"alert"`; not used in Step 1. |
 
 **Gotcha:** `Event` carries an integer item id, not a path. The backend must keep a
-stable `id -> MenuItemId` map and rebuild it whenever the tree is mutated, because
-the shell caches layout revisions.
+stable `id -> MenuItemId` map (`MenuIdMap`) whose ids are **never reused**. When
+rows disappear, prune only the absent entries - never rebuild the map from
+scratch, because the shell caches layout revisions and a recycled id would route
+a click to the wrong row.
 
 ### 1.6 AppIndicator (Tier 2 - legacy fallback)
 
 Used when no `org.kde.StatusNotifierWatcher` is available but an AppIndicator
 compatibility layer exists (older Ubuntu, some XFCE/LXDE setups, XEmbed trays).
 
+- **Watcher absence or refusal is not fatal:** the item is still exported on
+  the session bus, `TrayManager::create` succeeds, and
+  `TrayIcon::support_level(Icon)` reports `Partial(reason)` naming the missing
+  watcher or the rejection. Neither absence nor a rejection fails `create` -
+  both are the degraded `Partial` case. Other failures do return an error and
+  create no icon: no session bus at all, a refused bus name, a failed object
+  export, a worker-runtime failure, or the startup readiness timeout
+  (`READY_TIMEOUT`).
 - **Bus name:** `org.kde.StatusNotifierItem-<pid>` is *not* used; AppIndicator
   registers via its own service or exports the same `org.kde.StatusNotifierItem`
   interface on a requested name.
-- **Detection order:** try `org.kde.StatusNotifierWatcher` first; if the bus error
-  is `ServiceUnknown`, try `org.freedesktop.StatusNotifierWatcher`; if that also
-  fails, probe `PATH` for `ayatana-indicator-*` / `nm-applet` style hosts before
-  returning `UdaError::NotSupported`.
+- **Detection order:** try the KDE watcher interface first, then the
+  freedesktop interface. If neither accepts the item, keep the item exported and
+  report `Partial(reason)`; this backend does not probe `PATH` for AppIndicator
+  hosts or turn the degradation into a `create` failure.
 - **Menu:** the same `com.canonical.dbusmenu` interface is reused, so the menu
   model is shared with Tier 1. This is the reason UDA exports the menu as a
   separate object rather than embedding it in the item.
@@ -160,7 +170,7 @@ compatibility layer exists (older Ubuntu, some XFCE/LXDE setups, XEmbed trays).
 ### 1.7 linux capability matrix
 | Capability | Full when | Partial when | None when |
 |---|---|---|---|
-| Show icon | SNI or AppIndicator reachable | watcher absent: the item is exported and the shell may pick it up late, but UDA reports `Partial(reason)` via `TrayIcon::support_level` / `uda_tray_support_level` | no D-Bus session (`create` fails) |
+| Show icon | SNI or AppIndicator reachable | watcher absent or refuses the registration: the item is exported and the shell may pick it up late, but UDA reports `Partial(reason)` via `TrayIcon::support_level` / `uda_tray_support_level` | no D-Bus session (`create` fails) |
 | Tooltip | `ToolTip` accepted | shell ignores `ToolTip` (still shows `Title`) | - |
 | `on_click` | `Activate` delivered | shell never sends `Activate` | - |
 | `on_double_click` | **never Full on Linux** - SNI has no double-click event | UDA synthesises it from two `Activate` calls within ~500 ms | - |
@@ -208,7 +218,10 @@ Windows 95 behaviour, which is why the handshake is mandatory, not optional.
 ### 2.4 Window requirements
 - The `hWnd` must belong to a thread that runs a **message loop**
   (`GetMessageW` / `TranslateMessage` / `DispatchMessageW`). UDA therefore creates
-  a **hidden message-only window** (`HWND_MESSAGE` parent) on the worker thread.
+  a **hidden top-level window** on the worker thread: `WS_POPUP`, plus the
+  `WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE` extended styles. It must **not** be a
+  message-only (`HWND_MESSAGE`) window, because those never receive broadcast
+  messages such as `TaskbarCreated`.
 - The window class must be registered once per process; use a unique class name to
   avoid clashing with the host application's own classes.
 - The callback message id (`uCallbackMessage`) must be `>= WM_USER` (typically
@@ -241,6 +254,10 @@ Windows has no object-path protocol. The menu must be materialised natively:
 - `Shell_NotifyIconW(NIM_DELETE, ...)` **must** be called before the `hWnd` is
   destroyed, otherwise the shell keeps a dangling `hWnd` and explorer may show a
   ghost icon until restart.
+- **Explorer restart:** the shell broadcasts `TaskbarCreated` when explorer comes
+  back, and every icon registration is lost. The worker must handle that message
+  by re-issuing `NIM_ADD` (and re-applying version/tooltip/icon/visibility
+  state); it must not assume the icon survived.
 - UDA's `Drop` therefore: unregister icon -> stop the message pump -> destroy the
   hidden window -> unregister the window class (once the last icon is gone).
 - `Drop` is guarded by an internal `AtomicBool`/`Mutex` so a double drop, a drop
@@ -251,18 +268,26 @@ Windows has no object-path protocol. The menu must be materialised natively:
 ## 3. Cross-platform model rules
 
 ### 3.1 RGBA validation (shared by both backends)
-`from_rgba(width, height, stride, data)` is rejected (`UdaError::NotSupported`)
-when any of:
+`from_rgba(width, height, stride, data)` is rejected with
+`UdaError::InvalidArgument` (mapped to C `UDA_ERR_INVALID_ARGUMENT`, -1) when any
+of:
 - `width == 0 || height == 0`
 - `stride < width * 4`
 - `data.len() < stride * height`
 - `width * height * 4` overflows `usize`
 
 ### 3.2 Tooltip policy
-- Target length: **80 chars**, safe cap: **127 UTF-16 code units** (Windows).
-- Truncate on a `char` boundary; append no ellipsis (ellipsis chars may not encode
-  under a legacy console and would break the ASCII-only script rule).
-- Report `SupportLevel::Partial` when the tooltip had to be truncated.
+- Preferred length: **80 chars** (`TOOLTIP_TARGET_CHARS`); hard clamp: **127
+  chars** (`TOOLTIP_MAX_CHARS`, the Windows `szTip` safety cap).
+- Windows clamps at registration and update; `szTip` adds a second limit of 127
+  UTF-16 units, and a non-BMP character consumes two of them. Linux SNI forwards
+  the create-time text as-is; `TrayIcon::set_tooltip` / `uda_tray_set_tooltip`
+  clamp to 127 chars on both platforms.
+- Truncate on a `char` boundary; a UTF-16 cut never leaves a lone surrogate.
+  Append no ellipsis (ellipsis chars may not encode under a legacy console and
+  would break the ASCII-only script rule).
+- The clamp is silent: `support_level(Tooltip)` stays `Full`, and there is no
+  per-icon truncation signal.
 
 ### 3.3 Event delivery guarantee
 - Callbacks fire on the **tray worker thread**, never on the host's main thread.

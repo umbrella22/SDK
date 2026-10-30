@@ -17,6 +17,7 @@
 
 use std::env;
 use std::error::Error;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::path::PathBuf;
 
@@ -50,29 +51,37 @@ struct Options {
 
 impl Options {
     /// 解析命令行参数；未知选项按类型化错误拒绝，而不是静默忽略。
-    fn parse<I: Iterator<Item = String>>(args: I) -> Result<Self, String> {
+    ///
+    /// 参数以 [`OsString`] 接收：Unix 的 argv 可以包含非 UTF-8 字节，
+    /// `env::args()` 遇到这类参数会 panic。选项标志按 [`OsStr`] 精确比较，
+    /// 壁纸路径原样保存在 [`PathBuf`] 中，不做 UTF-8 转换。
+    fn parse<I: Iterator<Item = OsString>>(args: I) -> Result<Self, String> {
         let mut options = Self {
             dry_run: false,
             wallpaper: None,
         };
         for arg in args {
-            match arg.as_str() {
-                "--dry-run" => options.dry_run = true,
-                "--help" | "-h" => {
-                    println!("{USAGE}");
-                    println!("  --dry-run        只打印将执行的动作，不设置壁纸/发通知/持锁");
-                    println!("  [壁纸路径]       传给 set_wallpaper 的图片路径（可选）");
-                    std::process::exit(0);
+            if arg.as_os_str() == OsStr::new("--dry-run") {
+                options.dry_run = true;
+            } else if arg.as_os_str() == OsStr::new("--help") || arg.as_os_str() == OsStr::new("-h")
+            {
+                println!("{USAGE}");
+                println!("  --dry-run        只打印将执行的动作，不设置壁纸/发通知/持锁");
+                println!("  [壁纸路径]       传给 set_wallpaper 的图片路径（可选）");
+                std::process::exit(0);
+            } else if arg.to_string_lossy().starts_with('-') {
+                return Err(format!(
+                    "未知选项 `{}`；使用 --help 查看用法",
+                    arg.to_string_lossy()
+                ));
+            } else {
+                if options.wallpaper.is_some() {
+                    return Err(format!(
+                        "多余的参数 `{}`；壁纸路径只能指定一次",
+                        arg.to_string_lossy()
+                    ));
                 }
-                other if other.starts_with('-') => {
-                    return Err(format!("未知选项 `{other}`；使用 --help 查看用法"));
-                }
-                other => {
-                    if options.wallpaper.is_some() {
-                        return Err(format!("多余的参数 `{other}`；壁纸路径只能指定一次"));
-                    }
-                    options.wallpaper = Some(PathBuf::from(other));
-                }
+                options.wallpaper = Some(PathBuf::from(arg));
             }
         }
         Ok(options)
@@ -80,7 +89,7 @@ impl Options {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let options = Options::parse(env::args().skip(1)).map_err(CliError)?;
+    let options = Options::parse(env::args_os().skip(1)).map_err(CliError)?;
 
     if options.dry_run {
         print_plan(&options);
@@ -232,4 +241,60 @@ fn run_linux(options: &Options) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 用 `&str` 列表构造 [`Options::parse`] 需要的 `OsString` 迭代器。
+    fn parse_from(args: &[&str]) -> Result<Options, String> {
+        Options::parse(args.iter().copied().map(OsString::from))
+    }
+
+    #[test]
+    fn dry_run_and_a_wallpaper_path_are_parsed() {
+        let options = parse_from(&["--dry-run", "wallpaper.png"]).expect("valid arguments");
+
+        assert!(options.dry_run);
+        assert_eq!(options.wallpaper, Some(PathBuf::from("wallpaper.png")));
+    }
+
+    #[test]
+    fn an_unknown_option_is_rejected() {
+        // 静默忽略拼错的选项会让一次"诊断运行"看起来成功，实际却什么都没做。
+        let error = match parse_from(&["--dry-run", "--wallpaper"]) {
+            Ok(_) => panic!("an unknown option must not be accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("--wallpaper"), "error: {error}");
+        assert!(error.contains("--help"), "error: {error}");
+    }
+
+    #[test]
+    fn a_second_path_is_rejected() {
+        // 第二个路径过去会被静默丢弃，调用方无从得知哪个路径真正生效。
+        let error = match parse_from(&["a.png", "b.png"]) {
+            Ok(_) => panic!("a duplicate path must not be accepted"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("b.png"), "error: {error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_non_utf8_path_is_preserved_without_panicking() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        // argv 可以是任意字节序列；`env::args()` 遇到非 UTF-8 参数会 panic，
+        // 因此解析器接收 `OsString` 并原样存进 `PathBuf`，不做 UTF-8 转换。
+        let raw = vec![b'w', b'a', b'l', b'l', 0xff, b'.', b'p', b'n', b'g'];
+        let options = Options::parse(std::iter::once(OsString::from_vec(raw.clone())))
+            .expect("a non-UTF-8 path is still a valid path");
+
+        let path = options.wallpaper.expect("the path must be kept");
+        assert_eq!(path.as_os_str().as_bytes(), raw.as_slice());
+    }
 }

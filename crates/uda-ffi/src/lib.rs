@@ -15,8 +15,9 @@
 //! # Memory ownership
 //!
 //! - Strings **returned** by UDA are allocated by Rust and must be freed with
-//!   [`uda_free_string`]. The one exception is [`uda_status_message`] (a static
-//!   string), which must never be freed.
+//!   [`uda_free_string`], including [`uda_last_error_message`]. The only
+//!   exception is [`uda_status_message`] (a static string), which must never be
+//!   freed.
 //! - Strings **passed in** are borrowed for the duration of the call only.
 //! - Wake-lock handles are `uint64_t` values owned by this process; release each
 //!   exactly once with [`uda_wakelock_release`].
@@ -143,8 +144,11 @@ pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut c_int) -> c_int {
 
 /// Set the desktop wallpaper.
 ///
-/// `path` accepts both a plain filesystem path and a `file://` URI; an empty path
-/// is rejected as an invalid argument rather than being sent to the backend.
+/// `path` accepts a plain filesystem path on every backend. A `file://` URI is
+/// additionally accepted on GNOME and KDE, which convert it before handing the
+/// value to their shell; other backends (Windows, Hyprland, Sway, X11) require
+/// a path and receive the string unchanged. An empty path is rejected as an
+/// invalid argument rather than being sent to the backend.
 ///
 /// On failure a negative status code is returned and no wallpaper is changed.
 ///
@@ -276,11 +280,14 @@ pub unsafe extern "C" fn uda_media_send_command(command: c_int) -> c_int {
 /// Report which session and power actions this platform can perform.
 ///
 /// Writes a bitmask made of the `UDA_SESSION_CAP_*` constants to
-/// `*out_capabilities`; `0` means "no session backend exists on this target".
-/// The query is side-effect-free - it never touches the machine's power state;
-/// on Linux it answers from a one-shot, cached service probe - so a UI may
-/// call it freely to decide which menu entries to draw, and must call it
-/// before drawing one that could shut the machine down.
+/// `*out_capabilities`; `0` means "no receiver for any session action is
+/// reachable on this target". The query is side-effect-free - it never touches
+/// the machine's power state. On Linux the first call runs a one-shot service
+/// probe: every D-Bus await is bounded, and the session lookup starts after the
+/// presence check, so the worst case is about 35 seconds before the answer is
+/// cached; later calls are immediate. A UI therefore calls it once, ideally off
+/// the main thread, before drawing a menu - and must call it before drawing one
+/// that could shut the machine down.
 ///
 /// A set bit means a receiver for the action was reachable when the
 /// capabilities were queried; the attempt can still fail (hibernation
@@ -443,9 +450,11 @@ pub unsafe extern "C" fn uda_get_wallpaper(out_path: *mut *mut c_char) -> c_int 
 
 /// # Safety
 ///
-/// `s` must be null or a pointer obtained from [`uda_get_wallpaper`]. Freeing a
-/// pointer owned by the caller is undefined behaviour. Passing null is a no-op,
-/// so callers may free unconditionally.
+/// `s` must be null or a pointer obtained from an export that transfers string
+/// ownership to the caller: [`uda_get_wallpaper`], [`uda_media_get_metadata`],
+/// [`uda_tray_support_reason`] or [`uda_last_error_message`]. Freeing any other
+/// pointer is undefined behaviour. Passing null is a no-op, so callers may free
+/// unconditionally.
 #[no_mangle]
 pub unsafe extern "C" fn uda_free_string(s: *mut c_char) {
     let _ = util::catch_boundary(|| {
@@ -598,8 +607,12 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> c_int {
 /// to the caller: release it with [`uda_free_string`] and it stays valid until
 /// then, no matter how many other UDA calls run in between. Returns null when
 /// no failure has been recorded on this thread yet.
+///
+/// **Reading consumes the message.** The slot is emptied before the string is
+/// built, so an immediate second call returns null; a binding that needs the
+/// text twice must copy it or keep the returned allocation alive.
 #[no_mangle]
-pub extern "C" fn uda_last_error_message() -> *const c_char {
+pub extern "C" fn uda_last_error_message() -> *mut c_char {
     util::last_error_pointer()
 }
 
@@ -647,6 +660,11 @@ pub extern "C" fn uda_status_message(status: c_int) -> *const c_char {
 /// may call it freely to decide whether to build tray UI at all, and what to
 /// degrade gracefully.
 ///
+/// `UDA_TRAY_CAP_CLICK` and `UDA_TRAY_CAP_DOUBLE_CLICK` are always cleared:
+/// the C ABI has no click-callback registration, so activation is delivered
+/// only through menu rows. The constants stay defined for a future click API;
+/// a host must not infer click events from this bitmask today.
+///
 /// # Safety
 ///
 /// `out_capabilities` must point at a writable `uint32_t` location.
@@ -658,9 +676,13 @@ pub unsafe extern "C" fn uda_tray_capabilities(out_capabilities: *mut u32) -> c_
     }
 
     util::catch_boundary(|| {
+        // The C ABI cannot deliver click callbacks, so the backend's click bits
+        // are masked off rather than advertised. See the doc comment above.
+        const UNDELIVERABLE_BY_C_ABI: u32 =
+            tray::UDA_TRAY_CAP_CLICK | tray::UDA_TRAY_CAP_DOUBLE_CLICK;
         // SAFETY: null was rejected above, and the caller guarantees a writable
         // `uint32_t` at this address.
-        unsafe { *out_capabilities = tray::capabilities().bits() };
+        unsafe { *out_capabilities = tray::capabilities().bits() & !UNDELIVERABLE_BY_C_ABI };
         Ok(())
     })
 }
@@ -670,10 +692,11 @@ pub unsafe extern "C" fn uda_tray_capabilities(out_capabilities: *mut u32) -> c_
 /// Writes one of the `UDA_TRAY_SUPPORT_LEVEL_*` codes to `*out_level`:
 /// `UDA_TRAY_SUPPORT_LEVEL_FULL` when nothing degraded,
 /// `UDA_TRAY_SUPPORT_LEVEL_PARTIAL` when the icon is live but its registration
-/// recorded a degradation - on Linux, a session without a
-/// `StatusNotifierWatcher`, where the item is exported yet the shell may never
-/// display it - and `UDA_TRAY_SUPPORT_LEVEL_NONE` only when the backend never
-/// claimed a tray at all (not reachable through handles this library issued).
+/// recorded a degradation - on Linux, no `StatusNotifierWatcher` is reachable
+/// or the watcher refuses the registration, so the item is exported yet the
+/// shell may never display it - and `UDA_TRAY_SUPPORT_LEVEL_NONE` only when the
+/// backend never claimed a tray at all (not reachable through handles this
+/// library issued).
 ///
 /// The answer is per icon, not per platform: `uda_tray_capabilities()` reports
 /// which code paths exist, this reports what actually happened to *this* icon,
@@ -706,8 +729,9 @@ pub unsafe extern "C" fn uda_tray_support_level(handle: u64, out_level: *mut i32
 /// On success `*out_reason` receives a heap C string the caller must release
 /// with [`uda_free_string`], or NULL when the icon is not degraded - check the
 /// pointer, not the status. A degraded icon (see `uda_tray_support_level`)
-/// always carries a non-empty reason naming what is missing, e.g. a session
-/// with no `StatusNotifierWatcher`; a fully supported icon reports NULL.
+/// always carries a non-empty reason naming what is missing or refused, e.g. a
+/// session with no `StatusNotifierWatcher` or a watcher that rejects the item;
+/// a fully supported icon reports NULL.
 ///
 /// # Safety
 ///
@@ -741,8 +765,11 @@ pub unsafe extern "C" fn uda_tray_support_reason(
 ///
 /// `name` is the application name used for registration (the D-Bus bus name on
 /// Linux, the window class on Windows); a null `name` selects the library
-/// default. `tooltip` may be null or empty; text longer than 127 `char`s is
-/// clamped, and the call still succeeds.
+/// default. `tooltip` may be null or empty. Windows applies the 127-`char`
+/// clamp at registration and then fits the result into szTip's 127 UTF-16
+/// units (a non-BMP character uses two); Linux SNI forwards the create-time
+/// text as-is. `uda_tray_set_tooltip` clamps to 127 `char`s on both platforms,
+/// and registration still succeeds either way.
 ///
 /// On success `*out_handle` receives a non-zero handle for every other
 /// `uda_tray_*` call. On failure it is left untouched.
@@ -889,9 +916,10 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> c_in
 /// Append a plain text row to a menu.
 ///
 /// `callback` is invoked on the **tray worker thread** when the row is
-/// activated. Passing `None` (null) is legal: the row toggles silently, which is
-/// what a host using a polling model wants. `user_data` is handed back to the
-/// callback untouched and is never dereferenced by UDA.
+/// activated. Passing `None` (null) is legal: the row still renders, but
+/// activating it does nothing. A text row has no toggle state, and there is no
+/// API to read a row's state. `user_data` is handed back to the callback
+/// untouched and is never dereferenced by UDA.
 ///
 /// On success `*out_item_id` receives the row's stable, non-zero id, which the
 /// callback also receives so a host does not need its own table.
@@ -1325,9 +1353,19 @@ mod tests {
         let status = unsafe { uda_tray_capabilities(&mut bits) };
         assert_eq!(status, UDA_OK);
 
-        // The export must forward the backend's answer verbatim: the bits it
-        // reports are the module-level query's own.
-        assert_eq!(bits, tray::capabilities().bits());
+        // The C ABI has no click-callback registration, so those bits are
+        // deliberately cleared even when the platform backend can measure
+        // clicks.
+        const UNDELIVERABLE_BY_C_ABI: u32 =
+            tray::UDA_TRAY_CAP_CLICK | tray::UDA_TRAY_CAP_DOUBLE_CLICK;
+        assert_eq!(
+            bits & UNDELIVERABLE_BY_C_ABI,
+            0,
+            "the C ABI delivers activation only through menu rows: {bits:#x}"
+        );
+
+        // Every other bit must forward the backend's answer verbatim.
+        assert_eq!(bits, tray::capabilities().bits() & !UNDELIVERABLE_BY_C_ABI);
         assert_eq!(
             bits & !tray::DOCUMENTED_TRAY_CAPABILITIES,
             0,
@@ -1447,10 +1485,17 @@ mod tests {
             .expect("the message is valid UTF-8");
         assert!(text.contains("out_theme"), "got: {text}");
 
+        // Reading consumed the message: an immediate second call with no new
+        // failure reports "nothing recorded".
+        assert!(
+            uda_last_error_message().is_null(),
+            "the message slot must be empty after a successful read"
+        );
+
         // Ownership moved to the caller: released through the export that frees
         // every other returned string.
         // SAFETY: the pointer came from `uda_last_error_message` above and has
         // not been released yet.
-        unsafe { uda_free_string(pointer.cast_mut()) };
+        unsafe { uda_free_string(pointer) };
     }
 }

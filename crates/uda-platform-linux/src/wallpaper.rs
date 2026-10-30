@@ -686,20 +686,28 @@ impl WallpaperManager for LinuxWallpaperManager {
         crate::sync::run_async(async move {
             let info = detect_environment().unwrap_or_default();
 
-            // GNOME and KDE each own a native tier. A native tier that ran and
-            // failed is not final: `DetectionFailed` means "this backend did
-            // not work", so the cascade falls through to the CLI chain. Any
-            // other error variant is a caller error and final.
-            let native = match info.desktop_environment {
-                DesktopEnvironment::Gnome => Some((
+            // GNOME and KDE each own a native tier. The GNOME predicate is the
+            // same one `get_wallpaper` and `capabilities` use, so a Unity
+            // session (which keeps GNOME's gsettings keys) cannot read through
+            // gsettings while writing through the Hyprland/X11 chain. A native
+            // tier that ran and failed is not final: `DetectionFailed` means
+            // "this backend did not work", so the cascade falls through to the
+            // CLI chain. Any other error variant is a caller error and final.
+            let native = if gnome_wallpaper_keys(&info) {
+                Some((
                     "gsettings",
                     Self::set_wallpaper_gnome(&path, &options).await,
-                )),
-                DesktopEnvironment::Kde => Some((
-                    "plasmashell",
-                    Self::set_wallpaper_kde(&path, &options).await,
-                )),
-                DesktopEnvironment::Xfce | DesktopEnvironment::Unknown => None,
+                ))
+            } else {
+                match info.desktop_environment {
+                    DesktopEnvironment::Kde => Some((
+                        "plasmashell",
+                        Self::set_wallpaper_kde(&path, &options).await,
+                    )),
+                    DesktopEnvironment::Gnome
+                    | DesktopEnvironment::Xfce
+                    | DesktopEnvironment::Unknown => None,
+                }
             };
             if let Some((backend, result)) = native {
                 match result {

@@ -440,11 +440,6 @@ class Uda:
         self._tray_icons: list["TrayIcon"] = []
         #: 本对象创建、尚未销毁的托盘菜单。
         self._tray_menus: list["TrayMenu"] = []
-        #: 保活所有已注册的 C 回调蹦床。
-        #:
-        #: ctypes 的 ``CFUNCTYPE`` 实例必须被强引用：一旦被 GC，底层函数指针
-        #: 悬空，而库端仍持有该地址，托盘线程回调时就会跳进已释放的内存。
-        self._trampolines: list[Any] = []
 
     # ------------------------------------------------------------------
     # ctypes 原型声明（内部实现，业务代码不应触碰）
@@ -574,8 +569,11 @@ class Uda:
         self._lib.uda_tray_menu_create.argtypes = [c_uint64_p]
         self._lib.uda_tray_menu_create.restype = ctypes.c_int32
 
-        # 回调签名与 include/uda.h 的 typedef 一致；`None` 表示不注册回调，
-        # ctypes 会按空指针传入，库端即得到"静默行"。
+        # 回调签名与 include/uda.h 的 typedef 一致。不注册回调时**不能**直接
+        # 传 Python ``None``：argtype 是 ``CFUNCTYPE``，ctypes 会报
+        # ``ArgumentError: expected CFunctionType instance instead of NoneType``。
+        # 因此由 ``_make_*_trampoline`` 返回同一 ``CFUNCTYPE`` 类型的空指针
+        # （``ctypes.cast(None, ...)``），库端才会收到 NULL 并建出"静默行"。
         self._TextCallback = ctypes.CFUNCTYPE(
             None, ctypes.c_uint64, ctypes.c_void_p
         )
@@ -761,6 +759,9 @@ class Uda:
         fill_mode: str = FillMode.FILL,
     ) -> None:
         """设置桌面壁纸。
+
+        所有平台都接受普通文件路径；``file://`` URI 仅在 GNOME 与 KDE 上额外
+        支持（由后端自行转换），其他后端要求传入文件路径。
 
         Args:
             path: 图片文件路径。
@@ -965,8 +966,6 @@ class Uda:
                 menu.destroy()
             except Exception:  # noqa: BLE001 - 逐一清理，互不阻断
                 pass
-
-        self._trampolines.clear()
 
     def __enter__(self) -> "Uda":
         return self
@@ -1375,6 +1374,19 @@ class WakeLock:
 # --------------------------------------------------------------------------
 
 
+#: 销毁失败、必须继续保活的 ctypes 回调蹦床（进程级）。
+#:
+#: ``uda_tray_menu_destroy`` 只有在没有行回调正在执行时才会成功；失败时菜单
+#: 及其蹦床仍归托盘工作线程所有，此时释放蹦床就是 use-after-free。这里**只**
+#: 保留蹦床对象本身，绝不保留 :class:`TrayMenu`：菜单持有 ``self._uda``，若把
+#: 整个菜单钉在模块级集合里，一次失败的销毁就会让 :class:`Uda` 永远无法被回收，
+#: ``Uda.release_all`` / ``Uda.__del__`` 也就再不会释放常亮锁与托盘图标。
+#: 这里不直接保留 TrayMenu，因此菜单可被回收；但用户 callback/payload 若引用
+#: 了 :class:`Uda`，仍会通过蹦床闭包间接保活它，这是用户闭包自身的引用链。
+#: 重试成功后再按 identity 摘除蹦床。
+_ORPHANED_TRAMPOLINES: list[Any] = []
+
+
 class TrayMenu:
     """托盘右键菜单。
 
@@ -1394,6 +1406,12 @@ class TrayMenu:
     def __init__(self, uda: "Uda") -> None:
         self._uda = uda
         self._handle = 0
+        #: 本菜单注册的 C 回调蹦床（``CFUNCTYPE`` 实例及其闭包载荷）。
+        #:
+        #: 必须由菜单自己强引用：ctypes 实例一旦被 GC，底层函数指针悬空，
+        #: 而库端仍持有该地址。只有 ``uda_tray_menu_destroy`` 成功后，这些
+        #: 引用才可以释放（见 :meth:`destroy`）。
+        self._trampolines: list[Any] = []
         #: 已添加的行（按添加顺序），用于 :meth:`item_for` 反查。
         self._items: list["TrayItem"] = []
         self._create()
@@ -1421,7 +1439,8 @@ class TrayMenu:
         """添加一行普通文本项。
 
         Args:
-            label: 菜单项文本；空白文本会被库拒绝（``UDA_ERR_NOT_SUPPORTED``）。
+            label: 菜单项文本；空白文本会被库拒绝（``UDA_ERR_INVALID_ARGUMENT``，
+                -1）。
             callback: 点击回调，签名为 ``(item_id, user_data) -> None``。
                 回调运行在**托盘工作线程**上，必须尽快返回，不能直接操作 UI。
             user_data: 原样透传给回调的 Python 对象（由本封装保活）。
@@ -1445,7 +1464,7 @@ class TrayMenu:
         self._items.append(item)
         # 保活蹦床与用户回调对象，防止被 GC 后函数指针悬空。
         if keepalive is not None:
-            self._uda._trampolines.append(keepalive)
+            self._trampolines.append(keepalive)
         return item
 
     def add_separator(self) -> "TrayMenu":
@@ -1497,7 +1516,7 @@ class TrayMenu:
         item = TrayItem(self, item_id, "checkbox", label, callback)
         self._items.append(item)
         if keepalive is not None:
-            self._uda._trampolines.append(keepalive)
+            self._trampolines.append(keepalive)
         return item
 
     # ------------------------------------------------------------------
@@ -1512,14 +1531,18 @@ class TrayMenu:
 
         Returns:
             ``(c_function_pointer, keepalive)``。``c_function_pointer`` 直接
-            传给 ``uda_tray_menu_add_text``，``keepalive`` 需被强引用，
-            否则 ctypes 实例被回收后指针悬空。
+            传给 ``uda_tray_menu_add_text``；无回调时是同一 ``CFUNCTYPE``
+            类型的空指针（NULL），调用方只需在本次 FFI 调用期间持有它。
+            ``keepalive`` 需被强引用（无回调时为 ``None``），否则 ctypes
+            实例被回收后指针悬空。
         """
+        uda = self._uda
         if callback is None:
             # 传 NULL 表示"静默行"，库端仍会渲染与响应，只是无回调。
-            return None, None
+            # argtype 是 CFUNCTYPE，Python None 会被 ctypes 拒绝，因此显式
+            # 造一个同类型的空函数指针；这个 cast 对象只需活到本次调用返回。
+            return ctypes.cast(None, uda._TextCallback), None
 
-        uda = self._uda
         # user_data 闭包捕获：Python 对象随蹦床一起被保活，生命周期与行一致。
         payload = user_data
 
@@ -1536,7 +1559,7 @@ class TrayMenu:
                 print(f"[UDA tray] 文本菜单回调异常: {exc!r}", file=sys.stderr)
 
         factory = uda._TextCallback
-        # 注意：必须持有返回的 CFUNCTYPE 实例，见 Uda._trampolines 说明。
+        # 注意：必须持有返回的 CFUNCTYPE 实例，见 TrayMenu._trampolines 说明。
         c_function = factory(invoke)
         keepalive = (c_function, callback, payload)
         return c_function, keepalive
@@ -1547,10 +1570,12 @@ class TrayMenu:
         user_data: Any,
     ) -> tuple[Any, Any]:
         """把 Python 复选框回调包装成 C 函数指针。"""
-        if callback is None:
-            return None, None
-
         uda = self._uda
+        if callback is None:
+            # 同 :meth:`_make_text_trampoline`：argtype 是 CFUNCTYPE，
+            # 必须传同类型的空指针而不是 Python None。
+            return ctypes.cast(None, uda._CheckboxCallback), None
+
         payload = user_data
 
         def invoke(item_id: int, checked: int, raw_user_data: Any = None) -> None:
@@ -1587,21 +1612,42 @@ class TrayMenu:
     def destroy(self) -> None:
         """销毁菜单句柄。
 
-        在 :meth:`TrayIcon.set_menu` 之后调用是安全的：图标持有自己的引用，
-        托盘仍可正常工作。销毁后句柄不可再用。
+        销毁会把菜单从所有图标上摘下：图标本身仍然存在，只是不再有菜单；
+        托盘端已克隆的行快照也会静默失效，不再触达 Python 回调。
 
         若某个行回调正在执行，FFI 会返回错误且菜单保持完整——此时不得释放
         任何 ctypes 回调；等回调返回后重试即可。只有成功后，本方法才清空
-        句柄并解除登记，此后旧行快照也不再触达 Python 蹦床。
+        句柄与回调蹦床并解除登记。
         """
         if self._handle == 0:
             return
         handle = self._handle
-        status = self._uda._lib.uda_tray_menu_destroy(handle)
-        self._uda._check(status, f"uda_tray_menu_destroy({handle})")
+        try:
+            status = self._uda._lib.uda_tray_menu_destroy(handle)
+            self._uda._check(status, f"uda_tray_menu_destroy({handle})")
+        except UdaError:
+            # 失败时菜单与蹦床都仍归托盘线程所有：只把蹦床本身钉在模块级列表
+            # 里（按 identity 去重，重复失败不会堆积），不直接保留 self——它持有
+            # ``_uda``。用户 callback/payload 仍可能间接引用 Uda，那是用户闭包
+            # 自身的引用链，不能由本类代为切断。
+            # 释放一个托盘线程可能仍在调用的函数指针会造成 use-after-free，
+            # 多保留几份蹦床显然更安全。调用方等回调返回后重试，成功即移除。
+            for trampoline in self._trampolines:
+                if not any(kept is trampoline for kept in _ORPHANED_TRAMPOLINES):
+                    _ORPHANED_TRAMPOLINES.append(trampoline)
+            raise
         # 成功：FFI 侧菜单已销毁且回调门已关闭，旧行快照不会再调用蹦床，
         # 现在解除登记、释放 ctypes 引用才是安全的。
         self._handle = 0
+        # 按 identity（而不是相等）摘除先前失败时钉住的同一批对象：蹦床是元组，
+        # 按值比较可能误删另一个菜单持有的等价保活引用；逐个 identity 比较也
+        # 能清掉同一对象被重复钉入的副本。
+        _ORPHANED_TRAMPOLINES[:] = [
+            kept
+            for kept in _ORPHANED_TRAMPOLINES
+            if not any(kept is trampoline for trampoline in self._trampolines)
+        ]
+        self._trampolines.clear()
         self._uda._unregister_tray_menu(self)
 
     def __enter__(self) -> "TrayMenu":

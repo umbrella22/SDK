@@ -13,9 +13,14 @@
  * Memory ownership
  * ----------------
  *   - Strings RETURNED by UDA are allocated by the library and must be released
- *     with `uda_free_string()`. Passing null to `uda_free_string()` is a no-op,
- *     so callers may free unconditionally. The one exception is
- *     `uda_status_message()` (a static string), which must NOT be freed.
+ *     with `uda_free_string()`, including `uda_last_error_message()`. Passing
+ *     null to `uda_free_string()` is a no-op, so callers may free
+ *     unconditionally. The only exception is `uda_status_message()` (a static
+ *     string), which must NOT be freed.
+ *   - Reading `uda_last_error_message()` consumes the stored message: the slot
+ *     is emptied before the string is built, so a second call without an
+ *     intervening failure returns NULL. Copy the text (or keep the returned
+ *     allocation) if it is needed twice.
  *   - Strings PASSED IN are borrowed for the duration of the call only; the
  *     caller keeps ownership and must keep them alive until the call returns.
  *   - Wake-lock handles are plain `uint64_t` values owned by this process.
@@ -31,7 +36,9 @@
  * ABI stability
  * -------------
  * The exported symbol set is append-only. New capabilities are added as new
- * functions; existing signatures, constants and status codes do not change.
+ * functions; existing functions remain ABI-compatible (a source-level change
+ * such as adding or removing `const` on a pointer is called out in the
+ * CHANGELOG), and existing constants and status codes keep their values.
  */
 
 #ifndef UDA_H_
@@ -52,15 +59,15 @@ extern "C" {
  * @section ownership Ownership in one paragraph
  *
  * String handles returned by this library are allocated by Rust and must be
- * released with uda_free_string(); the exceptions (uda_last_error_message()
- * and uda_status_message()) are documented on their own declarations. Every
- * string passed *into* a call is borrowed for the duration of that call only:
- * the caller keeps ownership and may free it immediately afterwards. Tray
- * icons and menus are opaque handles into process-local tables; the caller
- * owns the *handle* and must destroy it exactly once with uda_tray_destroy() /
- * uda_tray_menu_destroy(). Callback pointers registered on a menu row are
- * retained by UDA for the lifetime of that row, and the menu (not the
- * callback) is the unit of destruction.
+ * released with uda_free_string(); that includes uda_last_error_message(). The
+ * only exception is uda_status_message(), a static string documented on its own
+ * declaration. Every string passed *into* a call is borrowed for the duration
+ * of that call only: the caller keeps ownership and may free it immediately
+ * afterwards. Tray icons and menus are opaque handles into process-local
+ * tables; the caller owns the *handle* and must destroy it exactly once with
+ * uda_tray_destroy() / uda_tray_menu_destroy(). Callback pointers registered on
+ * a menu row are retained by UDA for the lifetime of that row, and the menu
+ * (not the callback) is the unit of destruction.
  */
 
 /* ------------------------------------------------------------------------- */
@@ -142,10 +149,11 @@ extern "C" {
 #define UDA_MEDIA_CMD_STOP 5
 
 /**
- * A session backend exists on this platform.
+ * The calling user's session can be ended.
  *
- * This bit says nothing by itself: it only means at least one of the six actions
- * below is reachable. Test the action's own bit before offering it.
+ * This is set when logind can resolve the caller's own session, or a desktop
+ * logout manager is reachable - the two paths that can actually terminate the
+ * session. Power actions have their own bits and do not imply this one.
  */
 #define UDA_SESSION_CAP_MANAGEMENT 0x00010000u
 /** The session can be locked - the only action safe to automate. */
@@ -172,18 +180,31 @@ extern "C" {
 #define UDA_TRAY_CAP_ICON 0x00000100u
 /** The tray exposes hover text. */
 #define UDA_TRAY_CAP_TOOLTIP 0x00000200u
-/** The tray reports a single primary click. */
+/**
+ * The tray backend can report a single primary click.
+ *
+ * Reserved: always cleared by uda_tray_capabilities() because the C ABI has no
+ * click-callback registration, so activation is delivered only through menu
+ * rows. The flag remains defined for a future click API; do not infer click
+ * events from the bitmask today.
+ */
 #define UDA_TRAY_CAP_CLICK 0x00000400u
 /**
- * The tray reports a native double click. Never set on Linux (SNI has no
- * double-click signal); a host there synthesises it from two clicks.
+ * The tray backend can report a native double click.
+ *
+ * Reserved for the same reason as UDA_TRAY_CAP_CLICK: never set on Linux (SNI
+ * has no double-click signal), and always cleared by uda_tray_capabilities()
+ * because the C ABI cannot register a click callback.
  */
 #define UDA_TRAY_CAP_DOUBLE_CLICK 0x00000800u
 /** The tray exposes a context menu. */
 #define UDA_TRAY_CAP_CONTEXT_MENU 0x00001000u
 /** Menu rows can render a checkbox state. */
 #define UDA_TRAY_CAP_CHECKBOX 0x00002000u
-/** Menu rows can be added, removed, or relabelled at runtime. */
+/**
+ * Menu rows can be added at runtime; the C ABI does not expose removal or
+ * relabelling (the Rust core supports both).
+ */
 #define UDA_TRAY_CAP_DYNAMIC_MENU 0x00004000u
 
 /* Support levels (uda_tray_support_level). These describe what actually      */
@@ -196,9 +217,10 @@ extern "C" {
  */
 #define UDA_TRAY_SUPPORT_LEVEL_NONE 0
 /**
- * The icon is live, but its registration recorded a degradation: on Linux, a
- * session with no StatusNotifierWatcher, where the item is exported on the bus
- * yet the shell may never display it. uda_tray_support_reason() explains it.
+ * The icon is live, but its registration recorded a degradation: on Linux, no
+ * StatusNotifierWatcher is reachable or the watcher refuses the registration,
+ * so the item is exported on the bus yet the shell may never display it.
+ * uda_tray_support_reason() explains it.
  */
 #define UDA_TRAY_SUPPORT_LEVEL_PARTIAL 1
 /** The icon is live and nothing about its registration degraded. */
@@ -220,9 +242,12 @@ int32_t uda_detect_theme(int32_t *out_theme);
 /**
  * Set the desktop wallpaper.
  *
- * Accepts both a plain filesystem path and a `file://` URI. An empty (or
- * whitespace-only) path is rejected with UDA_ERR_INVALID_ARGUMENT before any
- * backend is consulted, on every platform.
+ * `path` is a plain filesystem path on every backend. A `file://` URI is
+ * additionally accepted on GNOME and KDE, which convert it before handing the
+ * value to their shell; Windows, Hyprland, Sway and X11 require a path and
+ * receive the string unchanged. An empty (or whitespace-only) path is rejected
+ * with UDA_ERR_INVALID_ARGUMENT before any backend is consulted, on every
+ * platform.
  *
  * @param path       Null-terminated UTF-8 filesystem path. Must not be null.
  * @param fill_mode  One of the UDA_FILL_* codes.
@@ -250,7 +275,10 @@ int32_t uda_get_wallpaper(char **out_path);
  *
  * Passing NULL is a no-op, so callers may free unconditionally.
  *
- * @param s  A pointer obtained from `uda_get_wallpaper()`, or NULL.
+ * @param s  A pointer obtained from `uda_get_wallpaper()`,
+ *           `uda_media_get_metadata()`, `uda_tray_support_reason()` or
+ *           `uda_last_error_message()`, or NULL. Freeing any other pointer is
+ *           undefined behaviour.
  */
 void uda_free_string(char *s);
 
@@ -415,10 +443,13 @@ int32_t uda_media_send_command(int32_t command);
  * Writes a bitmask made of the UDA_SESSION_CAP_* flags to `*out_capabilities`;
  * 0 means "no receiver for any session action is reachable on this target".
  *
- * The query is side-effect-free - it never touches the machine's power state;
- * on Linux it answers from a one-shot, cached service probe - so a host may
- * call it freely to decide which menu entries to draw, and *must* call it
- * before drawing one that could shut the machine down.
+ * The query is side-effect-free - it never touches the machine's power state.
+ * On Linux the first call runs a one-shot service probe: every D-Bus await is
+ * bounded, and the session lookup starts after the presence check, so the
+ * worst case is about 35 seconds before the answer is cached; later calls are
+ * immediate. A host therefore calls it once, ideally off the UI thread, before
+ * drawing a menu - and *must* call it before drawing one that could shut the
+ * machine down.
  *
  * A set bit means a receiver for the action was reachable when the
  * capabilities were queried; the attempt can still fail (hibernation switched
@@ -536,10 +567,14 @@ int32_t uda_session_shutdown(void);
  * it stays valid until then, no matter how many other UDA calls run in between.
  * Returns NULL when no failure has been recorded on this thread yet.
  *
+ * Reading consumes the message: the slot is emptied before the string is built,
+ * so an immediate second call returns NULL. A host that needs the text twice
+ * must copy it or keep the returned allocation alive.
+ *
  * @return A newly allocated, null-terminated C string owned by the caller, or
  *         NULL.
  */
-const char *uda_last_error_message(void);
+char *uda_last_error_message(void);
 
 /**
  * Describe a status code with a static string.
@@ -596,15 +631,17 @@ const char *uda_status_message(int32_t status);
  * `user_data` is handed back to the callback verbatim. UDA never dereferences
  * it; keeping it alive is the host's responsibility.
  *
- * The callback may be NULL, which yields a silent row that still renders and
- * still reports its state in later calls.
+ * The callback may be NULL, which yields a silent row that still renders. A
+ * NULL-callback text row has no toggle state; a NULL-callback checkbox keeps
+ * its initial state and never toggles. There is no API to read a row's state.
  *
  * DEGRADED REGISTRATIONS
  *
  * A successful uda_tray_create() means the item is registered with the
  * platform's tray service, not that the user will ever see it. On Linux the
  * shell learns about tray items from a StatusNotifierWatcher; when the session
- * has none, the icon is exported but may stay invisible. Such an icon reports
+ * has none, or the watcher refuses the registration, the icon is still exported
+ * but may stay invisible. Such an icon reports
  * UDA_TRAY_SUPPORT_LEVEL_PARTIAL from uda_tray_support_level() with a
  * human-readable explanation from uda_tray_support_reason(). Windows has no
  * watcher step and always reports FULL for a live icon.
@@ -617,8 +654,12 @@ const char *uda_status_message(int32_t status);
  *                    Linux, window class on Windows). An empty string selects
  *                    this library's default name. Must be null-terminated
  *                    UTF-8, or NULL for the default.
- * @param tooltip     Hover text; may be NULL or empty. Text longer than 127
- *                    characters is clamped (the call still succeeds).
+ * @param tooltip     Hover text; may be NULL or empty. Windows applies the
+ *                    127-character clamp at registration and then fits the
+ *                    result into the 127 UTF-16 units of szTip (a non-BMP
+ *                    character uses two); Linux SNI forwards the create-time
+ *                    text as-is. uda_tray_set_tooltip() clamps to 127
+ *                    characters on both platforms (the call still succeeds).
  * @param out_handle  Receives a non-zero handle on success. Must not be null.
  *                    Left untouched on failure.
  * @return UDA_OK on success, otherwise a negative status code.
@@ -659,7 +700,7 @@ int32_t uda_tray_set_icon_path(uint64_t handle, const char *path);
  * @param width   Pixel width, non-zero.
  * @param height  Pixel height, non-zero.
  * @param stride  Bytes per row; must be at least `width * 4`.
- * @param data    Pointer to the pixels, or NULL when `len` is zero.
+ * @param data    Pointer to `len` readable pixel bytes. Must not be NULL.
  * @param len     Readable byte count at `data`.
  * @return UDA_OK on success, otherwise a negative status code.
  */
@@ -823,6 +864,11 @@ int32_t uda_tray_menu_destroy(uint64_t menu_handle);
  * - it never registers anything with the shell - so a host may call it freely
  * to decide whether to build tray UI at all, and what to degrade gracefully.
  *
+ * UDA_TRAY_CAP_CLICK and UDA_TRAY_CAP_DOUBLE_CLICK are always cleared: the C
+ * ABI has no click-callback registration, so activation is delivered only
+ * through menu rows. The constants remain defined for a future click API; do
+ * not infer click events from this bitmask today.
+ *
  * @param out_capabilities  Receives the bitmask. Must not be null.
  * @return UDA_OK on success, otherwise a negative status code.
  */
@@ -834,8 +880,9 @@ int32_t uda_tray_capabilities(uint32_t *out_capabilities);
  * Writes one of the UDA_TRAY_SUPPORT_LEVEL_* codes to `*out_level`:
  * UDA_TRAY_SUPPORT_LEVEL_FULL when nothing degraded,
  * UDA_TRAY_SUPPORT_LEVEL_PARTIAL when the icon is live but its registration
- * recorded a degradation (on Linux: no StatusNotifierWatcher, so the item is
- * exported yet the shell may never display it), and
+ * recorded a degradation (on Linux: no StatusNotifierWatcher, or the watcher
+ * refuses the registration, so the item is exported yet the shell may never
+ * display it), and
  * UDA_TRAY_SUPPORT_LEVEL_NONE only when the backend never claimed a tray at
  * all - not reachable through handles this library issued.
  *
@@ -861,8 +908,9 @@ int32_t uda_tray_support_level(uint64_t handle, int32_t *out_level);
  * with uda_free_string(), or NULL when the icon is not degraded - check the
  * pointer rather than the status. A degraded icon (see
  * uda_tray_support_level()) always carries a non-empty, human-readable reason
- * naming what is missing, e.g. a session with no StatusNotifierWatcher; a
- * fully supported icon reports NULL.
+ * naming what is missing or refused, e.g. a session with no
+ * StatusNotifierWatcher or a watcher that rejects the item; a fully supported
+ * icon reports NULL.
  *
  * @param handle      A handle from uda_tray_create().
  * @param out_reason  Receives the newly allocated reason string, or NULL. Must

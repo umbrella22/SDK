@@ -99,9 +99,10 @@ pub(crate) async fn screensaver_present() -> Result<bool, UdaError> {
 /// `DBusProxy::list_names` resolves to the fdo error type rather than
 /// `zbus::Error`, so that one call cannot go through
 /// [`crate::internal_dbus`]; it gets its own `DBUS_TIMEOUT` and the same
-/// mapping instead. Callers that check several services on one bus (the
-/// session backend's logout candidates) share this single round trip;
-/// [`bus_has_service`] is the one-name convenience wrapper.
+/// mapping instead. [`bus_has_service`] is the one-name convenience wrapper
+/// over it; the session backend's logout-candidate probe is a different query
+/// (it needs activatable names too) and keeps its own helper in `session.rs`
+/// rather than sharing this round trip.
 pub(crate) async fn bus_unique_names(
     connection: &Connection,
     step: &str,
@@ -214,48 +215,38 @@ impl WakeLockManager for LinuxWakeLockManager {
         let connection = Arc::clone(&self.connection);
 
         Ok(WakeLockGuard::new(Box::new(move || {
-            let connection = Arc::clone(&connection);
-            std::thread::spawn(move || {
-                let runtime = match tokio::runtime::Runtime::new() {
-                    Ok(runtime) => runtime,
-                    Err(e) => {
-                        log::warn!("could not start a runtime to release the wake lock: {e}");
-                        return;
-                    }
-                };
-                runtime.block_on(async move {
-                    // Releasing is best effort: the guard has already been
-                    // consumed, so a failure can only be logged.
-                    let proxy = match internal_dbus(
-                        "building the ScreenSaver proxy to release the wake lock",
-                        zbus::Proxy::new(
-                            &connection,
-                            SCREEN_SAVER_SERVICE,
-                            SCREEN_SAVER_PATH,
-                            SCREEN_SAVER_INTERFACE,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(proxy) => proxy,
-                        Err(e) => {
-                            log::warn!("{e}");
-                            return;
-                        }
-                    };
+            // Releasing is best effort: the guard has already been consumed, so
+            // a failure can only be logged. The crate's `run_async` bridge is
+            // used instead of `std::thread::spawn` because this is a `Drop`
+            // path and thread construction there panics when the OS refuses;
+            // `run_async` reports that failure as a value.
+            let release = crate::sync::run_async(async move {
+                let proxy = internal_dbus(
+                    "building the ScreenSaver proxy to release the wake lock",
+                    zbus::Proxy::new(
+                        &connection,
+                        SCREEN_SAVER_SERVICE,
+                        SCREEN_SAVER_PATH,
+                        SCREEN_SAVER_INTERFACE,
+                    ),
+                )
+                .await?;
 
-                    let release = internal_dbus(
-                        "releasing the wake lock",
-                        proxy.call::<&str, (u32,), ()>("UnInhibit", &(cookie,)),
-                    )
-                    .await;
-                    if let Err(e) = release {
-                        log::warn!("{e}");
-                    }
-                });
-            })
-            .join()
-            .ok();
+                internal_dbus(
+                    "releasing the wake lock",
+                    proxy.call::<&str, (u32,), ()>("UnInhibit", &(cookie,)),
+                )
+                .await
+            });
+            // The bridge has two failure layers: it may fail to run the future
+            // at all, or the future itself may report that `UnInhibit` failed.
+            // Both leave the lock held, so both are logged.
+            match release {
+                Ok(Ok(())) => log::debug!("wake lock released"),
+                Ok(Err(error)) | Err(error) => {
+                    log::warn!("could not release the wake lock: {error}");
+                }
+            }
         })))
     }
 }

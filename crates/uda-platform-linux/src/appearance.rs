@@ -54,22 +54,30 @@ impl LinuxAppearanceManager {
     /// Run `program` under `COMMAND_TIMEOUT` and collect what it printed.
     ///
     /// Every failure mode - the tool missing, no stdout pipe, unreadable output,
-    /// a timeout - collapses to `None`, and a run that is abandoned is killed so
+    /// a timeout - collapses to `None` and is logged at `debug` so a host can
+    /// see why a source was skipped, and a run that is abandoned is killed so
     /// no helper lingers. Callers decide whether a failed run means "absent
     /// source" ([`Self::run_command`]) or "the probe cannot answer"
     /// ([`Self::probe_command`]).
     async fn run_tool(program: &str, args: &[&str]) -> Option<ToolRun> {
-        let mut child = tokio::process::Command::new(program)
+        let mut child = match tokio::process::Command::new(program)
             .args(args)
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .stdout(Stdio::piped())
             .spawn()
-            .ok()?;
+        {
+            Ok(child) => child,
+            Err(error) => {
+                log::debug!("{program} could not be started: {error}");
+                return None;
+            }
+        };
 
         let mut stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
+                log::debug!("{program} produced no stdout pipe");
                 let _ = child.start_kill();
                 return None;
             }
@@ -86,9 +94,21 @@ impl LinuxAppearanceManager {
                 success: status.success(),
                 stdout: bytes,
             }),
-            _ => {
-                // A timeout leaves the tool running and a broken read or wait
-                // leaves its fate unknown; either way this run is over.
+            Ok((Err(error), _)) => {
+                log::debug!("{program} output could not be read: {error}");
+                // The tool may still be running; end it rather than leave it
+                // behind.
+                let _ = child.start_kill();
+                None
+            }
+            Ok((_, Err(error))) => {
+                log::debug!("{program} could not be waited on: {error}");
+                let _ = child.start_kill();
+                None
+            }
+            Err(_) => {
+                log::debug!("{program} did not finish within {COMMAND_TIMEOUT:?}");
+                // A timeout leaves the tool running; this run is over.
                 let _ = child.start_kill();
                 None
             }

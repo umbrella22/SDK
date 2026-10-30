@@ -120,6 +120,18 @@ const SESSION_CAPABILITY_ALL =
 /** 提交给 shell 的托盘图标最长边像素数（见 docs/internals/tray_specs.md §2.6）。 */
 const TRAY_ICON_MAX_EXTENT = 32;
 
+/**
+ * 销毁失败、必须在进程生命周期内保活的托盘资源。
+ *
+ * `menu.destroy()` 失败意味着 FFI 判定仍有行回调在执行，而
+ * `TrayMenu.keepalives` 是那些 koffi 蹦床在 JS 侧的最后一份引用：`Uda.dispose()`
+ * 若照常清空 `_menus` / `_icons`，回调一旦落地就会调用已被回收的 koffi 槽位
+ * （use-after-free，表现为崩溃或误触发）。因此把销毁失败的对象钉在这个模块级
+ * 数组里，进程结束前不释放——刻意泄漏少量对象，换取不会崩溃。
+ * 成功销毁的资源不会进入本数组。
+ */
+const _ORPHANED_TRAY_RESOURCES = [];
+
 /** 交叉编译 Windows DLL 时常见的 target 三元组（用于 WSL 等宿主不同的场景）。 */
 const WINDOWS_TARGET_TRIPLES = [
   'x86_64-pc-windows-msvc',
@@ -739,6 +751,9 @@ class Uda {
   /**
    * 设置桌面壁纸。
    *
+   * 所有平台都接受普通文件路径；`file://` URI 仅在 GNOME 与 KDE 上额外支持
+   * （由后端自行转换），其他后端要求传入文件路径。
+   *
    * @param {'crop' | 'fill' | 'fit' | 'stretch'} [fillMode] 填充模式，默认 `fill`。
    */
   setWallpaper(wallpaperPath, fillMode = 'fill') {
@@ -897,7 +912,10 @@ class Uda {
       try {
         icon.destroy();
       } catch {
-        // 逐一清理，互不阻断。
+        // 逐一清理，互不阻断。销毁失败说明图标可能仍挂在托盘上、仍有回调
+        // 可达，因此钉进进程级数组（见 _ORPHANED_TRAY_RESOURCES），不随本次
+        // dispose 被丢弃。
+        _ORPHANED_TRAY_RESOURCES.push(icon);
       }
     }
 
@@ -905,7 +923,10 @@ class Uda {
       try {
         menu.destroy();
       } catch {
-        // 逐一清理，互不阻断。
+        // 菜单失败尤其危险：`menu.keepalives` 是 koffi 蹦床在 JS 侧的最后
+        // 一份引用，丢掉它会让仍在执行的回调落到已释放的槽位上。连菜单一起
+        // 钉住，直到进程退出。
+        _ORPHANED_TRAY_RESOURCES.push(menu);
       }
     }
 
@@ -1581,8 +1602,18 @@ class TrayIcon {
     if (this.destroyed) {
       return;
     }
+    // 先注销句柄：失败时不能把 destroyed 置位，否则重试会被当成空操作，
+    // 图标永远留在托盘上。成功后才记录终态（与 TrayMenu.destroy 一致）。
+    // 但失败路径必须同时置 _stopped：`wait()` 以 `_stopped || destroyed` 为
+    // 退出条件，而失败后 destroyed 仍为 false（保留重试可能），不置 _stopped
+    // 会让已经开始的等待永远挂起。宁可让 wait 返回、由调用方处理异常。
+    try {
+      this.uda._check(this.uda._lib.trayDestroy(this.handle), 'uda_tray_destroy');
+    } catch (error) {
+      this._stopped = true;
+      throw error;
+    }
     this.destroyed = true;
-    this.uda._check(this.uda._lib.trayDestroy(this.handle), 'uda_tray_destroy');
     // 图标注销之后，菜单自己的句柄仍然有效，由调用方决定何时销毁。
     this.menu = null;
     this._stopped = true;

@@ -14,7 +14,7 @@
 //!    the bytes are not valid UTF-8.
 //! 3. **Errors survive the return.** Rust's error type cannot be represented in
 //!    C, so the message is parked in a thread-local slot that
-//!    `uda_last_error_message()` reads back as a C string.
+//!    `uda_last_error_message()` takes back as a caller-owned C string.
 
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -47,7 +47,7 @@ pub(crate) fn take_last_message() -> Option<String> {
         .flatten()
 }
 
-/// Turn the recorded failure message into a fresh, caller-owned C allocation.
+/// Take the recorded failure message as a fresh, caller-owned C allocation.
 ///
 /// The returned pointer is heap-allocated by this call and the caller becomes
 /// its owner: it must be released with `uda_free_string()` and stays valid
@@ -55,17 +55,22 @@ pub(crate) fn take_last_message() -> Option<String> {
 /// returned when no failure is recorded, or when the message cannot be
 /// represented as a C string (an interior null byte, which real diagnostics do
 /// not produce).
-pub(crate) fn last_error_pointer() -> *const c_char {
+///
+/// **Reading consumes the message.** The slot is emptied before the string is
+/// built, so a second call without an intervening failure returns `null`. A
+/// binding that wants to keep the text for later must copy it (or hold on to
+/// the returned allocation) rather than call this export again.
+pub(crate) fn last_error_pointer() -> *mut c_char {
     let Some(message) = take_last_message() else {
-        return std::ptr::null();
+        return std::ptr::null_mut();
     };
 
     // An interior null byte has no C representation. Real diagnostics never
     // contain one, so that case reports "no message" rather than a truncated
     // string.
     match CString::new(message) {
-        Ok(rendered) => rendered.into_raw().cast_const(),
-        Err(_) => std::ptr::null(),
+        Ok(rendered) => rendered.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }
 
@@ -287,8 +292,8 @@ mod tests {
         // caller releases each one with the same `uda_free_string` used for
         // every other returned string.
         unsafe {
-            free_c_string(pointer.cast_mut());
-            free_c_string(next.cast_mut());
+            free_c_string(pointer);
+            free_c_string(next);
         }
     }
 
@@ -300,7 +305,7 @@ mod tests {
         let pointer = last_error_pointer();
         assert!(!pointer.is_null());
         assert_eq!(read_c_string(pointer), "recovered");
-        unsafe { free_c_string(pointer.cast_mut()) };
+        unsafe { free_c_string(pointer) };
     }
 
     #[test]

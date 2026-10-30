@@ -40,10 +40,10 @@
 //! table stays honest about which locks are actually live.
 
 use std::collections::HashMap;
-use std::process::{Child, Command};
+use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use uda_core::error::UdaError;
 use uda_core::wakelock::{WakeLockGuard, WakeLockType};
@@ -55,15 +55,18 @@ use crate::error::Failure;
 ///
 /// `systemd-inhibit --mode=block` returns as soon as its child exits, so the
 /// child is a `sleep` bounded by this value. The lock is therefore *not*
-/// indefinite, which the C caller is told about through
-/// `uda_last_error_message()` when the tier is used.
+/// indefinite; the cap is documented on `uda_wakelock_acquire` (a success
+/// return writes no `uda_last_error_message`). The constant stays available on
+/// every target because the reaper's retirement log names it there too.
 const CLI_LOCK_SECONDS: u64 = 3600;
 
 /// Bound authorization and startup before exposing a CLI lock handle.
-const CLI_START_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(target_os = "linux")]
+const CLI_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // systemd-inhibit starts this command only after acquiring its inhibition FD.
 // The shell acknowledges that boundary, then becomes the bounded lock holder.
+#[cfg(target_os = "linux")]
 const CLI_HOLDER: &str = "printf R; exec sleep \"$1\"";
 
 /// How a live entry must be released.
@@ -71,6 +74,13 @@ enum LockEntry {
     /// A native guard whose `Drop` performs the release.
     Native(WakeLockGuard),
     /// A CLI child holding the lock for as long as it runs.
+    ///
+    /// Only the Linux CLI tier constructs this variant in production code; the
+    /// registry tests synthesize entries directly, and every other target still
+    /// matches it in `release` and the reaper so the registry code stays
+    /// target-independent. The lint allowance covers the non-Linux builds where
+    /// nothing constructs it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Cli { child: Child, expires_at: Instant },
 }
 
@@ -112,19 +122,28 @@ fn next_valid_handle() -> Result<WakeLockHandle, Failure> {
 
 /// Acquire a wake lock of `lock_type` and return its handle.
 ///
-/// Tries the platform's native IPC first (Tier 1/2) and falls back to the CLI
-/// tier (Tier 3) when the session cannot provide it - for example a Linux box
-/// whose session bus has no ScreenSaver service but whose system bus still has
-/// systemd-logind. A box with neither tier refuses instead: the CLI tier
-/// verifies its receiver before spawning, so a lock nobody would honour is
+/// On Linux the platform's native IPC is tried first (Tier 1/2) and the CLI
+/// tier (Tier 3) is used when the session cannot provide it - for example a
+/// Linux box whose session bus has no ScreenSaver service but whose system bus
+/// still has systemd-logind. A box with neither tier refuses instead: the CLI
+/// tier verifies its receiver before spawning, so a lock nobody would honour is
 /// never reported as held.
+///
+/// On every other target the CLI fallback does not exist (`systemd-inhibit` and
+/// the logind receiver it needs are Linux-only), so the native error is
+/// returned unchanged. Falling back there would replace the real failure -
+/// a `SetThreadExecutionState` refusal on Windows, for one - with a
+/// `NotSupported` that blames a tier which was never applicable.
 pub(crate) fn acquire(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
     match acquire_native(lock_type, reason) {
         Ok(guard) => register(next_valid_handle()?, LockEntry::Native(guard)),
+        #[cfg(target_os = "linux")]
         Err(error) => {
             log::debug!("native wake lock unavailable ({error}); trying the CLI tier");
             acquire_cli(lock_type, reason)
         }
+        #[cfg(not(target_os = "linux"))]
+        Err(error) => Err(Failure::Uda(error)),
     }
 }
 
@@ -175,7 +194,8 @@ fn acquire_native(lock_type: WakeLockType, reason: &str) -> Result<WakeLockGuard
 /// The `--what=` value the CLI tier passes for `lock_type`.
 ///
 /// The flag is the only difference the CLI tier can express between the two
-/// lock types.
+/// lock types. Linux-only, like the tier itself.
+#[cfg(target_os = "linux")]
 fn cli_what_flag(lock_type: WakeLockType) -> &'static str {
     match lock_type {
         WakeLockType::PreventDisplaySleep => "idle",
@@ -184,14 +204,14 @@ fn cli_what_flag(lock_type: WakeLockType) -> &'static str {
 }
 
 /// Acquire the lock through the CLI tier (`systemd-inhibit`).
+#[cfg(target_os = "linux")]
 fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, Failure> {
     // The lock only exists because systemd-logind receives it; refuse rather
     // than spawn an inhibit nobody would honour (see the verifier).
-    #[cfg(target_os = "linux")]
     verify_someone_receives_the_lock()?;
 
     let child = spawn_cli_holder(
-        Command::new("systemd-inhibit")
+        std::process::Command::new("systemd-inhibit")
             .arg("--who=UDA")
             .arg(format!("--why={reason}"))
             .arg(format!("--what={}", cli_what_flag(lock_type)))
@@ -211,56 +231,54 @@ fn acquire_cli(lock_type: WakeLockType, reason: &str) -> Result<WakeLockHandle, 
 
     let entry = LockEntry::Cli {
         child,
-        expires_at: Instant::now() + Duration::from_secs(CLI_LOCK_SECONDS),
+        expires_at: Instant::now() + std::time::Duration::from_secs(CLI_LOCK_SECONDS),
     };
     register(next_valid_handle()?, entry)
 }
 
 /// Wait for the wrapped command to acknowledge that Inhibit succeeded.
 /// A socket deadline bounds the wait without leaving a reader thread behind.
-fn spawn_cli_holder(command: &mut Command, timeout: Duration) -> Result<Child, Failure> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::io::Read;
-        use std::os::fd::OwnedFd;
-        use std::os::unix::net::UnixStream;
-        use std::process::Stdio;
+///
+/// Linux-only: the tier has no meaning anywhere else, and keeping the function
+/// out of other builds is what stops a dead non-Linux branch from being reached
+/// (or linted as dead code).
+#[cfg(target_os = "linux")]
+fn spawn_cli_holder(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<Child, Failure> {
+    use std::io::Read;
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    use std::process::Stdio;
 
-        let failure = |error| {
-            Failure::Uda(UdaError::NotSupported(format!(
-                "systemd-inhibit did not confirm acquiring the wake lock: {error}"
-            )))
-        };
-        let (mut ready, writer) = UnixStream::pair().map_err(failure)?;
-        ready.set_read_timeout(Some(timeout)).map_err(failure)?;
-        let mut child = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(OwnedFd::from(writer)))
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(failure)?;
-        // Command retains its copy of stdout after spawn; close it so an
-        // early child exit produces EOF rather than waiting for the timeout.
-        command.stdout(Stdio::null());
-        let mut marker = [0];
-        match ready.read_exact(&mut marker) {
-            Ok(()) if marker == *b"R" => Ok(child),
-            outcome => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let error = outcome.err().unwrap_or_else(|| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid readiness reply")
-                });
-                Err(failure(error))
-            }
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (command, timeout);
-        Err(Failure::Uda(UdaError::NotSupported(
-            "the systemd-inhibit fallback requires Linux".to_string(),
+    let failure = |error| {
+        Failure::Uda(UdaError::NotSupported(format!(
+            "systemd-inhibit did not confirm acquiring the wake lock: {error}"
         )))
+    };
+    let (mut ready, writer) = UnixStream::pair().map_err(failure)?;
+    ready.set_read_timeout(Some(timeout)).map_err(failure)?;
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(OwnedFd::from(writer)))
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(failure)?;
+    // Command retains its copy of stdout after spawn; close it so an
+    // early child exit produces EOF rather than waiting for the timeout.
+    command.stdout(Stdio::null());
+    let mut marker = [0];
+    match ready.read_exact(&mut marker) {
+        Ok(()) if marker == *b"R" => Ok(child),
+        outcome => {
+            let _ = child.kill();
+            let _ = child.wait();
+            let error = outcome.err().unwrap_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid readiness reply")
+            });
+            Err(failure(error))
+        }
     }
 }
 
@@ -437,6 +455,11 @@ fn live_count() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    use std::process::Command;
+    #[cfg(unix)]
+    use std::time::Duration;
 
     /// Serialises every test that inspects the shared registry.
     ///
@@ -680,6 +703,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn cli_lock_arguments_cover_the_requested_flags() {
         // The `--what` flag must widen for system-idle locks; this is the only
