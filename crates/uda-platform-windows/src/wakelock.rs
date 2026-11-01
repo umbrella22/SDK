@@ -10,19 +10,21 @@
 //! | Acquire lock | `SetThreadExecutionState(ES_DISPLAY_REQUIRED \| ES_SYSTEM_REQUIRED \| ES_CONTINUOUS)` |
 //! | Release lock | `SetThreadExecutionState(ES_CONTINUOUS)` |
 //!
-//! `SetThreadExecutionState` is process-wide state on the calling thread rather
-//! than a reference-counted handle: each call *replaces* the previous flags. This
-//! has two consequences that shape this module:
+//! `SetThreadExecutionState` is thread-scoped state rather than a
+//! reference-counted handle: each call *replaces* the previous flags on the
+//! calling thread, and a request dies with its thread. This has two
+//! consequences that shape this module:
 //!
 //! 1. `ES_CONTINUOUS` must be present for the request to persist until the next
 //!    call (without it the request lasts one suspend cycle).
-//! 2. Release means restoring the default `ES_CONTINUOUS`, which affects the
-//!    whole process. UDA therefore documents this as an intentional, single-lock
-//!    model rather than silently stacking guards.
+//! 2. The request must be made on - and cleared on - a thread that lives as
+//!    long as the lock. [`WakeLockManager::acquire`] therefore hands each lock
+//!    to a dedicated owner thread that parks between acquire and release, so
+//!    neither an FFI bridge's ephemeral worker nor a caller's async runtime
+//!    thread can silently drop the request.
 //!
 //! Unlike the FreeDesktop cookie returned by `org.freedesktop.ScreenSaver.Inhibit`,
-//! there is no cookie to hand back, so the Windows guard carries no payload: its
-//! only job is to restore the default state on drop.
+//! there is no cookie to hand back; the owner thread's exit *is* the release.
 
 use windows::Win32::System::Power::{
     SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED,
@@ -37,11 +39,15 @@ use uda_core::wakelock::{WakeLockGuard, WakeLockManager, WakeLockType};
 /// On drop the thread execution state is restored to the default
 /// `ES_CONTINUOUS`, which releases both the display and system requirements.
 ///
-/// The guard is intentionally not `Clone` and not `Send`-agnostic about ordering:
-/// because the underlying API is thread-scoped, releasing from a different thread
-/// than the one that acquired the lock would not clear the flag on the thread
-/// that actually holds it. It is still `Send` so it can be moved onto the thread
-/// that owns the lock, which is the common case.
+/// The guard is intentionally not `Clone`, but releasing it is
+/// thread-independent: the execution-state flags live on a dedicated owner
+/// thread that [`WindowsWakeLockManager::acquire`] creates, and the guard's
+/// release closure only signals that thread over a channel. Dropping the guard,
+/// or explicitly releasing it through
+/// [`WindowsWakeLockGuard::release`], therefore works from any thread: the
+/// owner thread performs the `SetThreadExecutionState(ES_CONTINUOUS)` reset
+/// itself. The guard is `Send` with no requirement that it return to the
+/// thread it was created on.
 pub struct WindowsWakeLockGuard {
     /// The core RAII guard that actually owns the release closure.
     ///
@@ -126,41 +132,6 @@ impl WindowsWakeLockManager {
             }
         }
     }
-
-    /// Apply an execution state and report whether the call succeeded.
-    ///
-    /// `SetThreadExecutionState` returns the *previous* state, or `0` on failure
-    /// (which happens only when the thread state is being changed from within a
-    /// power-notification callback).
-    fn apply(state: EXECUTION_STATE) -> Result<(), UdaError> {
-        // SAFETY: value-only FFI with no pointers and no invariants beyond the
-        // documented return contract.
-        let previous = unsafe { SetThreadExecutionState(state) };
-
-        if previous.0 == 0 {
-            return Err(UdaError::Internal(
-                "SetThreadExecutionState failed; wake locks cannot be changed from a power notification callback".to_string(),
-            ));
-        }
-
-        Ok(())
-    }
-
-    /// Restore the default execution state, releasing the wake lock.
-    ///
-    /// `ES_CONTINUOUS` on its own is the documented "clear all requirements"
-    /// call. This is used as the release closure handed to the core
-    /// [`WakeLockGuard`], so it must never fail: the previous state is logged
-    /// for diagnostics only.
-    fn release() {
-        // SAFETY: value-only FFI with no pointers and no invariants beyond the
-        // documented return contract.
-        let previous = unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
-
-        if previous.0 == 0 {
-            log::debug!("SetThreadExecutionState(ES_CONTINUOUS) reported a failure");
-        }
-    }
 }
 
 impl WindowsWakeLockManager {
@@ -182,6 +153,18 @@ impl WindowsWakeLockManager {
 
 #[async_trait::async_trait]
 impl WakeLockManager for WindowsWakeLockManager {
+    /// Acquire a wake lock on a thread that lives as long as the lock.
+    ///
+    /// `SetThreadExecutionState` is thread-scoped: a request made on a thread
+    /// dies with that thread. The FFI bridge may run this future on an
+    /// ephemeral worker (an ambient tokio runtime), so the request must be
+    /// owned by a thread this function controls - one that stays parked until
+    /// the guard releases it. Each lock therefore gets its own owner thread:
+    /// acquire reports through a rendezvous channel, the thread blocks on the
+    /// release channel (parked, no CPU), and the release closure - or the
+    /// guard's `Drop` closing the channel - is what lets the thread restore
+    /// `ES_CONTINUOUS` and exit. One thread per lock also keeps independent
+    /// locks independent: clearing one lock's flags cannot clear another's.
     async fn acquire(
         &self,
         lock_type: WakeLockType,
@@ -189,21 +172,74 @@ impl WakeLockManager for WindowsWakeLockManager {
     ) -> Result<WakeLockGuard, UdaError> {
         let state = Self::execution_state(lock_type);
 
-        Self::apply(state).map_err(|e| {
-            log::debug!("failed to acquire wake lock ({reason}): {e}");
-            e
-        })?;
+        // `acquired` carries the owner thread's verdict; `release` is the only
+        // thing that ends its loop. Closing `release` (a dropped guard) also
+        // unblocks `recv`, so the thread can never outlive its guard.
+        let (acquired, acquired_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        let reason = reason.to_string();
 
-        log::debug!(
-            "acquired Windows wake lock {lock_type:?} ({reason}); flags={:#x}",
-            state.0
-        );
+        std::thread::Builder::new()
+            .name("uda-wake-lock".to_string())
+            .spawn(move || {
+                // SAFETY: value-only FFI with no pointers and no invariants
+                // beyond the documented return contract; this thread owns the
+                // request for its whole life.
+                let previous = unsafe { SetThreadExecutionState(state) };
+                let verdict = if previous.0 == 0 {
+                    Err(UdaError::Internal(
+                        "SetThreadExecutionState failed; wake locks cannot be changed from a power notification callback"
+                            .to_string(),
+                    ))
+                } else {
+                    Ok(())
+                };
+                // If the acquirer vanished (caller cancelled the future, a
+                // timeout or select race), the send error ends the thread -
+                // and a thread's exit is itself what clears its execution
+                // state request, so no stale inhibition can outlive it. The
+                // normal path reports the verdict and parks.
+                if acquired.send(verdict).is_err() {
+                    return;
+                }
+                // Park until released. A channel close means the guard was
+                // dropped without an explicit release - still a release.
+                if release_rx.recv().is_ok() {
+                    log::debug!("wake lock released on its owner thread");
+                }
+                // SAFETY: `ES_CONTINUOUS` on its own is the documented "clear
+                // all requirements" call; restoring it on the same thread that
+                // set the flags is what actually ends the request.
+                unsafe { SetThreadExecutionState(ES_CONTINUOUS) };
+            })
+            .map_err(|error| {
+                UdaError::Internal(format!("could not spawn the wake-lock owner thread: {error}"))
+            })?;
 
-        // Unlike FreeDesktop (which hands back a cookie to feed to `UnInhibit`),
-        // Windows has no per-lock token: the release action is the process-wide
-        // "clear the flags" call. The closure therefore captures nothing and
-        // simply restores the default execution state when the guard is dropped.
-        Ok(WakeLockGuard::new(Box::new(Self::release)))
+        match acquired_rx.recv() {
+            Ok(Ok(())) => {
+                log::debug!(
+                    "acquired Windows wake lock {lock_type:?} ({reason}); flags={:#x}",
+                    state.0
+                );
+                // The closure only signals the owner thread; joining happens
+                // on that thread, so release never blocks the caller.
+                Ok(WakeLockGuard::new(Box::new(move || {
+                    // A send error means the thread already exited - the lock
+                    // is gone either way.
+                    let _ = release.send(());
+                })))
+            }
+            Ok(Err(error)) => {
+                log::debug!("failed to acquire wake lock ({reason}): {error}");
+                // The owner thread exits after reporting the failure, so no
+                // parked thread is left behind.
+                Err(error)
+            }
+            Err(_) => Err(UdaError::Internal(
+                "the wake-lock owner thread exited before acquiring".to_string(),
+            )),
+        }
     }
 }
 

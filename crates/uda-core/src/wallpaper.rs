@@ -38,6 +38,11 @@ impl Default for WallpaperOptions {
 /// Cross-platform wallpaper management interface.
 pub trait WallpaperManager {
     /// Set the system wallpaper to the image at `path`.
+    ///
+    /// `path` is a plain filesystem path on every backend. A `file://` URI is
+    /// additionally accepted on GNOME and KDE, which convert it to the value
+    /// their shell stores; other backends receive the string unchanged and
+    /// require a path.
     fn set_wallpaper(&self, path: &str, options: &WallpaperOptions) -> Result<(), UdaError>;
 
     /// Get the current system wallpaper path.

@@ -10,7 +10,11 @@ pub enum WakeLockType {
 }
 
 impl WakeLockType {
-    /// Map to FreeDesktop ScreenSaver inhibit flags (org.freedesktop.ScreenSaver).
+    /// Legacy inhibition flag values, retained for source compatibility.
+    ///
+    /// These are not arguments to `org.freedesktop.ScreenSaver.Inhibit`, whose
+    /// inputs are only the application name and reason. Platform backends must
+    /// use their protocol's actual signature and supported lock types.
     pub fn to_screen_saver_flags(&self) -> u32 {
         match self {
             WakeLockType::PreventDisplaySleep => 8, // InhibitIdle
