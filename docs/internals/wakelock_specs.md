@@ -11,16 +11,28 @@ Interface: org.freedesktop.ScreenSaver
 ### Inhibit
 
 ```text
-UInt32 Inhibit(String app_name, String reason, UInt32 flags)
+UInt32 Inhibit(String app_name, String reason)
 ```
 
 | 参数 | 说明 |
 |------|------|
 | app_name | 调用方应用名 |
 | reason | 申请锁的原因说明 |
-| flags | 8 = InhibitIdle（阻止屏幕休眠）；12 = InhibitIdle | InhibitSuspend（阻止系统挂起） |
 
 返回值 `cookie: u32` 是后续 `UnInhibit` 所需的句柄。
+
+此接口不接收 flags，不能选择系统挂起抑制。原生 `LinuxWakeLockManager`
+仅支持 `PreventDisplaySleep`；`PreventSystemIdle` 在发送任何 D-Bus 请求前
+返回 `UdaError::NotSupported`，供上层继续尝试其回退路径。
+
+原生 capability 仅探测 ScreenSaver：可达时返回 `WAKE_LOCK` 和带原因的
+`SupportLevel::Partial`（仅支持显示空闲抑制）；不可达时为空和 `None`。
+FFI 的 `systemd-inhibit --what=idle:sleep --mode=block` 回退属于 FFI 层，
+不能算入原生 manager 的能力。
+
+协议来源：
+- https://specifications.freedesktop.org/idle-inhibit-spec/latest/
+- https://github.com/KDE/kscreenlocker/blob/master/dbus/org.freedesktop.ScreenSaver.xml
 
 ### UnInhibit
 

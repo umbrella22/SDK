@@ -144,10 +144,13 @@ Every code change must pass:
 
 ## 6. Coding Conventions & Patterns
 
-1. **Error Handling:** Use `thiserror` for library-internal errors (see `crates/uda-core/src/error.rs`):
+1. **Error Handling:** Use `thiserror` for library-internal errors (see `crates/uda-core/src/error.rs`). The enum is `#[non_exhaustive]` - new variants may arrive in minor releases, so downstream `match`es need a wildcard arm:
    ```rust
    #[derive(thiserror::Error, Debug)]
+   #[non_exhaustive]
    pub enum UdaError {
+       #[error("Invalid argument: {0}")]
+       InvalidArgument(String),
        #[error("Feature not supported: {0}")]
        NotSupported(String),
        #[error("Detection failed: {0}")]

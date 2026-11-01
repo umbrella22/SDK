@@ -156,19 +156,23 @@ pub trait MediaManager {
 
     /// Send `command` to the active player.
     ///
-    /// Once a player has been selected, a refusal or a transport failure is
-    /// [`UdaError::CommandFailed`]. Reaching a player at all can fail first,
-    /// and those acquisition failures keep their own types: no player to
+    /// Failures before any player is addressed keep their own types, so a
+    /// non-`Ok` result does not always mean "the player declined": no player to
     /// address, a missing SMTC manager, or a manager acquisition await that
     /// fails is [`UdaError::NotSupported`]; a Linux session-bus connection
     /// failure or a Windows SMTC manager `RequestAsync` failure is
     /// [`UdaError::DetectionFailed`]; and runtime/proxy setup can be
-    /// [`UdaError::Internal`] - so a non-`Ok` result does not always mean "the
-    /// player declined". Whether a refusal *should* instead count as a
-    /// successful call (the platform cannot always distinguish "declined" from
-    /// "done") is an open cross-platform design question; until it is settled,
-    /// callers must treat a non-`Ok` result as "success was not confirmed"
-    /// rather than retrying blindly. See `docs/internals/media_specs.md` §3.4.
+    /// [`UdaError::Internal`].
+    ///
+    /// Once a player has been selected, an explicit refusal (an MPRIS error
+    /// reply, an SMTC `Try*Async()` returning `false`) is
+    /// [`UdaError::NotSupported`] - `include/uda.h` promises
+    /// `UDA_ERR_NOT_SUPPORTED` for a player that declines a command - while a
+    /// transport failure (a D-Bus timeout, a failed SMTC call) is
+    /// [`UdaError::CommandFailed`]. After a timeout or communication failure
+    /// the player may already have executed the command, so callers must treat
+    /// a non-`Ok` result as "success was not confirmed" rather than retrying
+    /// blindly. See `docs/internals/media_specs.md` §3.4.
     fn send_command(&self, command: MediaCommand) -> Result<(), UdaError>;
 
     /// The capabilities this platform's media backend can honour.

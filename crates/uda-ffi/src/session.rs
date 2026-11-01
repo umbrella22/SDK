@@ -12,20 +12,21 @@
 //! Five of the six actions end the user's session or stop the machine. This
 //! module therefore exposes:
 //!
-//! - [`session_capabilities`], a side-effect-free query returning a bitmask, so
+//! - `session_capabilities`, a side-effect-free query returning a bitmask, so
 //!   a UI can be built *before* the user asks for anything; and
 //! - the six action functions, each of which performs an irreversible operation
 //!   the moment it returns [`UDA_OK`](crate::abi::UDA_OK).
 //!
-//! Only [`uda_session_lock`] is safe to automate. Everything else must be gated
+//! Only `uda_session_lock` is safe to automate. Everything else must be gated
 //! behind a confirmation in the host application - the same rule the demo under
 //! `examples/` follows.
 //!
 //! # Capability bitmask
 //!
-//! [`session_capabilities`] reports the flags the platform's backend
-//! advertises. `0` means "no session backend exists here", which is also what a
-//! non-Linux, non-Windows target answers.
+//! `session_capabilities` reports the flags the platform's backend
+//! advertises. `0` means "no receiver for any session action is reachable
+//! here" - no backend, or a backend whose probes found nothing to talk to -
+//! which is also what a non-Linux, non-Windows target answers.
 
 use uda_core::capability::Capability;
 use uda_core::session::{SessionAction, SessionManager};
@@ -34,7 +35,7 @@ use crate::error::Failure;
 
 /// The actions the current platform's backend can deliver, as a bitmask.
 ///
-/// The bitmask is made of the [`UDA_SESSION_CAP_*`] constants and never
+/// The bitmask is made of the `UDA_SESSION_CAP_*` constants and never
 /// includes an action the backend cannot perform, so a caller can test
 /// "is shutdown offered?" before drawing a button for it.
 pub(crate) fn capabilities() -> Capability {
@@ -80,7 +81,7 @@ pub(crate) fn perform(action: SessionAction) -> Result<(), Failure> {
     #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         let _ = action;
-        Err(Failure::Uda(UdaError::NotSupported(
+        Err(Failure::Uda(uda_core::error::UdaError::NotSupported(
             "no session backend for this target".to_string(),
         )))
     }
@@ -88,9 +89,14 @@ pub(crate) fn perform(action: SessionAction) -> Result<(), Failure> {
 
 /// Check the capability, then dispatch to the matching backend method.
 ///
-/// Kept separate from [`perform`] for two reasons: the tests drive it with a
-/// mock manager (no D-Bus session, no Windows host), and it is where a typed
-/// [`UdaError`] becomes the ABI-level [`Failure`].
+/// Kept separate from [`perform`] so the tests can drive it with a mock manager
+/// (no D-Bus session, no Windows host). On targets without a backend the
+/// non-test build has no caller for it; the tests still exercise it there, hence
+/// the lint waiver rather than a `cfg` that would remove it from those tests.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows", test)),
+    allow(dead_code)
+)]
 fn run<M: SessionManager>(manager: &M, action: SessionAction) -> Result<(), Failure> {
     uda_core::session::perform(manager, action).map_err(Failure::from)
 }
@@ -290,33 +296,50 @@ mod tests {
     #[test]
     fn the_capability_query_neither_errors_nor_lies() {
         // The query is what a UI calls freely, so it must always answer, and it
-        // must never report an action the platform cannot reach.
+        // must only ever report one of the documented per-platform states.
         let capabilities = capabilities();
 
-        for action in [
-            SessionAction::Lock,
-            SessionAction::Logout,
-            SessionAction::Suspend,
-            SessionAction::Hibernate,
-            SessionAction::Reboot,
-            SessionAction::Shutdown,
-        ] {
-            if capabilities.contains(action.capability()) {
-                // An advertised action always sits behind a session backend: a
-                // bit without the management bit would mean a caller can be
-                // offered a button the platform has no code path for.
+        let full_set = Capability::SESSION_MANAGEMENT
+            | Capability::LOCK
+            | Capability::LOGOUT
+            | Capability::SUSPEND
+            | Capability::HIBERNATE
+            | Capability::REBOOT
+            | Capability::SHUTDOWN;
+
+        if cfg!(target_os = "windows") {
+            // Every supported Windows release ships the session/power Win32
+            // APIs, so the full matrix is unconditional there.
+            assert_eq!(capabilities, full_set);
+        } else if cfg!(target_os = "linux") {
+            // The Linux answer is probed, not hardcoded, and its two
+            // session-management bits are two views of one condition: some
+            // receiver can deliver a logout, whether the logind caller-session
+            // path or a reachable desktop session manager. Anything the
+            // documented seven misses would mean the probe and the matrix
+            // disagree; the absence of power bits without a manager is
+            // covered by the documented-set test above.
+            assert_eq!(
+                capabilities.contains(Capability::LOGOUT),
+                capabilities.contains(Capability::SESSION_MANAGEMENT),
+                "LOGOUT and SESSION_MANAGEMENT must agree, got {capabilities:?}"
+            );
+            if !capabilities.contains(Capability::LOCK)
+                && !capabilities.contains(Capability::LOGOUT)
+            {
                 assert!(
-                    capabilities.contains(Capability::SESSION_MANAGEMENT),
-                    "{action:?} advertised with no session backend behind it"
+                    capabilities.is_empty()
+                        || capabilities
+                            == Capability::SUSPEND
+                                | Capability::HIBERNATE
+                                | Capability::REBOOT
+                                | Capability::SHUTDOWN,
+                    "no lock and no logout receiver must leave only the power \
+                     actions or nothing, got {capabilities:?}"
                 );
             }
-        }
-
-        // On a real backend the management bit is always set; on an exotic
-        // target the answer is "nothing at all".
-        if cfg!(any(target_os = "linux", target_os = "windows")) {
-            assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
         } else {
+            // No backend on an exotic target: "nothing at all".
             assert!(capabilities.is_empty());
         }
     }

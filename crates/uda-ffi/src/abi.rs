@@ -119,6 +119,67 @@ pub const UDA_SESSION_CAP_REBOOT: u32 = 1u32 << 21;
 pub const UDA_SESSION_CAP_SHUTDOWN: u32 = 1u32 << 22;
 
 // ---------------------------------------------------------------------------
+// Tray capability bits (uda_tray_capabilities)
+// ---------------------------------------------------------------------------
+
+/// Capability bit: a tray backend exists at all (`SYSTEM_TRAY` in `uda-core`).
+pub const UDA_TRAY_CAP_SYSTEM_TRAY: u32 = 1 << 7;
+/// Capability bit: the icon can be shown, hidden and swapped at runtime.
+pub const UDA_TRAY_CAP_ICON: u32 = 1 << 8;
+/// Capability bit: the tray exposes hover text.
+pub const UDA_TRAY_CAP_TOOLTIP: u32 = 1 << 9;
+/// Capability bit: the tray reports a single primary click.
+///
+/// Reserved: the C ABI has no click-callback registration, so
+/// `uda_tray_capabilities` always clears this bit. It stays defined for a
+/// future click API; do not infer click events from the bitmask today.
+pub const UDA_TRAY_CAP_CLICK: u32 = 1 << 10;
+/// Capability bit: the tray reports a native double click (never true on Linux
+/// SNI, where it would have to be synthesised).
+///
+/// Reserved for the same reason as [`UDA_TRAY_CAP_CLICK`]: the C ABI cannot
+/// register a click callback, so `uda_tray_capabilities` always clears it.
+pub const UDA_TRAY_CAP_DOUBLE_CLICK: u32 = 1 << 11;
+/// Capability bit: the tray exposes a context menu.
+pub const UDA_TRAY_CAP_CONTEXT_MENU: u32 = 1 << 12;
+/// Capability bit: menu rows can render a checkbox state.
+pub const UDA_TRAY_CAP_CHECKBOX: u32 = 1 << 13;
+/// Capability bit: menu rows can be added at runtime; the C ABI does not
+/// expose removal or relabelling (the Rust core supports both).
+pub const UDA_TRAY_CAP_DYNAMIC_MENU: u32 = 1 << 14;
+
+// ---------------------------------------------------------------------------
+// Tray support levels (uda_tray_support_level)
+// ---------------------------------------------------------------------------
+
+/// Support-level code: the backend never claimed a tray at all.
+///
+/// Unreachable through handles `uda_tray_create` handed out - every created
+/// icon publishes the backend's capability set - but the mapping stays total,
+/// so a fabricated or half-registered icon cannot be read as healthy.
+pub const UDA_TRAY_SUPPORT_LEVEL_NONE: i32 = 0;
+/// Support-level code: the icon is live, but registration recorded a
+/// degradation (on Linux: no `StatusNotifierWatcher`, so the shell may never
+/// display the item). `uda_tray_support_reason` explains it.
+pub const UDA_TRAY_SUPPORT_LEVEL_PARTIAL: i32 = 1;
+/// Support-level code: the icon is live and nothing degraded.
+pub const UDA_TRAY_SUPPORT_LEVEL_FULL: i32 = 2;
+
+/// Every tray capability bit the C ABI documents.
+///
+/// Used by the drift tests in this crate (here and in `tray.rs`), so the list
+/// exists once. Private on purpose: it is not part of the header.
+#[cfg(test)]
+pub(crate) const DOCUMENTED_TRAY_CAPABILITIES: u32 = UDA_TRAY_CAP_SYSTEM_TRAY
+    | UDA_TRAY_CAP_ICON
+    | UDA_TRAY_CAP_TOOLTIP
+    | UDA_TRAY_CAP_CLICK
+    | UDA_TRAY_CAP_DOUBLE_CLICK
+    | UDA_TRAY_CAP_CONTEXT_MENU
+    | UDA_TRAY_CAP_CHECKBOX
+    | UDA_TRAY_CAP_DYNAMIC_MENU;
+
+// ---------------------------------------------------------------------------
 // Tray callbacks
 // ---------------------------------------------------------------------------
 
@@ -381,5 +442,57 @@ mod tests {
                 assert_ne!(bit, other, "capability bits must be distinct");
             }
         }
+    }
+
+    #[test]
+    fn tray_capability_bits_match_the_documented_values() {
+        // Literal values, not the constants against themselves: these numbers
+        // are part of the C ABI and the header carries them verbatim.
+        assert_eq!(UDA_TRAY_CAP_SYSTEM_TRAY, 1 << 7);
+        assert_eq!(UDA_TRAY_CAP_ICON, 1 << 8);
+        assert_eq!(UDA_TRAY_CAP_TOOLTIP, 1 << 9);
+        assert_eq!(UDA_TRAY_CAP_CLICK, 1 << 10);
+        assert_eq!(UDA_TRAY_CAP_DOUBLE_CLICK, 1 << 11);
+        assert_eq!(UDA_TRAY_CAP_CONTEXT_MENU, 1 << 12);
+        assert_eq!(UDA_TRAY_CAP_CHECKBOX, 1 << 13);
+        assert_eq!(UDA_TRAY_CAP_DYNAMIC_MENU, 1 << 14);
+    }
+
+    #[test]
+    fn tray_capability_bits_are_distinct_powers_of_two() {
+        let bits = [
+            UDA_TRAY_CAP_SYSTEM_TRAY,
+            UDA_TRAY_CAP_ICON,
+            UDA_TRAY_CAP_TOOLTIP,
+            UDA_TRAY_CAP_CLICK,
+            UDA_TRAY_CAP_DOUBLE_CLICK,
+            UDA_TRAY_CAP_CONTEXT_MENU,
+            UDA_TRAY_CAP_CHECKBOX,
+            UDA_TRAY_CAP_DYNAMIC_MENU,
+        ];
+        for (index, bit) in bits.iter().enumerate() {
+            assert_eq!(bit.count_ones(), 1, "capability bits must be powers of two");
+            assert_eq!(
+                *bit,
+                1 << (7 + index),
+                "bit positions are part of the C ABI"
+            );
+            for other in &bits[index + 1..] {
+                assert_ne!(bit, other, "capability bits must be distinct");
+            }
+        }
+        // The documented mask must be exhaustive: a new bit added above but
+        // forgotten here would silently stop being drift-checked.
+        assert_eq!(
+            DOCUMENTED_TRAY_CAPABILITIES,
+            bits.iter().fold(0u32, |acc, bit| acc | bit)
+        );
+    }
+
+    #[test]
+    fn tray_support_levels_match_the_documented_values() {
+        assert_eq!(UDA_TRAY_SUPPORT_LEVEL_NONE, 0);
+        assert_eq!(UDA_TRAY_SUPPORT_LEVEL_PARTIAL, 1);
+        assert_eq!(UDA_TRAY_SUPPORT_LEVEL_FULL, 2);
     }
 }

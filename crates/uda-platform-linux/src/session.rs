@@ -27,7 +27,7 @@
 //! - **Logout**: `TerminateSession("")` first - the empty session id means "the
 //!   calling one", so no session enumeration is needed; when logind refuses, the
 //!   desktop's own session manager (`org.gnome.SessionManager`,
-//!   `org.kde.Shutdown`, `org.xfce.Session.Manager`) is tried.
+//!   `org.kde.Shutdown`, `org.xfce.SessionManager`) is tried.
 //! - **Power**: logind only. There is no portable CLI equivalent that does its
 //!   own authorisation, so a machine without logind reports the action
 //!   unsupported rather than guessing at `shutdown -h now`.
@@ -39,29 +39,42 @@
 //! caller's session), which is not what a library caller wants: it has already
 //! decided, and it performs its own confirmation dialog.
 //!
+//! # Capabilities are probed, not assumed
+//!
+//! [`LinuxSessionManager::capabilities`] asks the buses which receivers are
+//! actually there before advertising anything. Power bits follow the logind
+//! manager. `LOCK` follows ScreenSaver or a resolvable `auto` session (which
+//! may be the user's display session). `LOGOUT` and `SESSION_MANAGEMENT`
+//! require the caller's own session or an owned/activatable desktop logout
+//! manager. `TerminateSession("")` never targets the display-session fallback.
+//! The bounded probe runs once per process and is cached.
+//!
+//! Whatever the probe said, an action that is attempted and then not delivered
+//! (logind refusing or timing out, `loginctl` exiting nonzero) reports
+//! `UDA_ERR_NOT_SUPPORTED`, the one failure code `include/uda.h` promises C
+//! hosts for an attempted session action; the diagnostic stays in the message.
+//!
 //! # Timeouts
 //!
-//! Every D-Bus await is wrapped in [`DBUS_TIMEOUT`], so a logind that is
-//! installing an update (and therefore not answering) costs a bounded wait
-//! instead of a hung caller.
+//! Every D-Bus await is wrapped in `DBUS_TIMEOUT`, and the four independent
+//! receiver probes run concurrently. The logind session lookup starts only
+//! after the presence answer arrives, so the worst-case first capability call
+//! is the presence probe plus the session lookup (about 35 seconds in the worst
+//! case), not four serial waits; a receiver that fails or times out loses only
+//! its own result.
 //!
 //! See `docs/internals/session_specs.md` for the full mapping.
 
-use std::process::Command;
-use std::time::Duration;
+use std::process::Stdio;
+use std::sync::OnceLock;
 
 use uda_core::capability::Capability;
 use uda_core::error::UdaError;
 use uda_core::session::{SessionAction, SessionManager};
 use zbus::Connection;
 
-/// Hard ceiling for one D-Bus round trip in this backend.
-///
-/// Power actions legitimately take a moment (logind talks to polkit and then to
-/// the init system), so five seconds is generous for a round trip while still
-/// bounding a wedged daemon.
-const DBUS_TIMEOUT: Duration = Duration::from_secs(5);
-
+use crate::wakelock::{logind_present, screensaver_present};
+use crate::{COMMAND_TIMEOUT, DBUS_TIMEOUT};
 /// `org.freedesktop.login1` destination on the system bus.
 const LOGIN1_SERVICE: &str = "org.freedesktop.login1";
 
@@ -95,26 +108,31 @@ impl LinuxSessionManager {
     }
 
     /// Connect to the **system** bus, where logind lives.
+    ///
+    /// A bus that cannot be reached folds into [`not_delivered`] like every
+    /// other failure in this module.
     async fn system_connection() -> Result<Connection, UdaError> {
         match tokio::time::timeout(DBUS_TIMEOUT, Connection::system()).await {
             Ok(Ok(connection)) => Ok(connection),
-            Ok(Err(e)) => Err(UdaError::DetectionFailed(format!(
+            Ok(Err(e)) => Err(not_delivered(format!(
                 "could not reach the system bus: {e}"
             ))),
-            Err(_) => Err(UdaError::DetectionFailed(
+            Err(_) => Err(not_delivered(
                 "connecting to the system bus timed out".to_string(),
             )),
         }
     }
 
     /// Connect to the **session** bus, where the screen saver lives.
+    ///
+    /// Same contract as [`Self::system_connection`].
     async fn session_connection() -> Result<Connection, UdaError> {
         match tokio::time::timeout(DBUS_TIMEOUT, Connection::session()).await {
             Ok(Ok(connection)) => Ok(connection),
-            Ok(Err(e)) => Err(UdaError::DetectionFailed(format!(
+            Ok(Err(e)) => Err(not_delivered(format!(
                 "could not reach the session bus: {e}"
             ))),
-            Err(_) => Err(UdaError::DetectionFailed(
+            Err(_) => Err(not_delivered(
                 "connecting to the session bus timed out".to_string(),
             )),
         }
@@ -123,15 +141,12 @@ impl LinuxSessionManager {
     /// Call a no-argument `login1.Manager` power method with `interactive: false`.
     ///
     /// Synchronous on the outside (the trait is synchronous), asynchronous on
-    /// the inside: one current-thread runtime per call owns the connection and
-    /// the proxy, so nothing outlives the call.
-    fn login1_power(&self, method: &str) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-        runtime.block_on(async {
+    /// the inside: the future is driven by `crate::sync::run_async`, which is
+    /// safe to call from inside a tokio runtime as well (P1-15). `method` is
+    /// `&'static str` so the name can travel into the future by copy instead of
+    /// an owned `String`, and stay available for the bridge-failure message.
+    fn login1_power(&self, method: &'static str) -> Result<(), UdaError> {
+        crate::sync::run_async(async move {
             let connection = Self::system_connection().await?;
 
             let proxy = match tokio::time::timeout(
@@ -142,12 +157,12 @@ impl LinuxSessionManager {
             {
                 Ok(Ok(proxy)) => proxy,
                 Ok(Err(e)) => {
-                    return Err(UdaError::DetectionFailed(format!(
+                    return Err(not_delivered(format!(
                         "could not build a logind proxy: {e}"
                     )));
                 }
                 Err(_) => {
-                    return Err(UdaError::DetectionFailed(
+                    return Err(not_delivered(
                         "building the logind proxy timed out".to_string(),
                     ));
                 }
@@ -166,21 +181,23 @@ impl LinuxSessionManager {
                     Ok(())
                 }
                 Ok(Err(e)) => Err(map_login1_error(method, &e.to_string())),
-                Err(_) => Err(UdaError::CommandFailed(format!(
+                Err(_) => Err(not_delivered(format!(
                     "logind {method} timed out after {DBUS_TIMEOUT:?}"
                 ))),
             }
         })
+        // A bridge failure would otherwise leak as -5; fold it into the
+        // contract error like every other outcome.
+        .map_err(|e| {
+            not_delivered(format!(
+                "the logind {method} call could not be attempted: {e}"
+            ))
+        })?
     }
 
     /// Lock through `org.freedesktop.ScreenSaver`, then through `loginctl`.
     fn lock_via_screen_saver(&self) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
-        runtime.block_on(async {
+        crate::sync::run_async(async {
             let connection = Self::session_connection().await?;
 
             let proxy = match tokio::time::timeout(
@@ -196,12 +213,12 @@ impl LinuxSessionManager {
             {
                 Ok(Ok(proxy)) => proxy,
                 Ok(Err(e)) => {
-                    return Err(UdaError::CommandFailed(format!(
+                    return Err(not_delivered(format!(
                         "could not build a screen-saver proxy: {e}"
                     )));
                 }
                 Err(_) => {
-                    return Err(UdaError::CommandFailed(
+                    return Err(not_delivered(
                         "building the screen-saver proxy timed out".to_string(),
                     ));
                 }
@@ -215,14 +232,13 @@ impl LinuxSessionManager {
                 }
                 // A missing or refused screen saver is recoverable: the CLI tier
                 // below locks the session directly through logind.
-                Ok(Err(e)) => Err(UdaError::CommandFailed(format!(
-                    "the screen saver refused Lock: {e}"
-                ))),
-                Err(_) => Err(UdaError::CommandFailed(
+                Ok(Err(e)) => Err(not_delivered(format!("the screen saver refused Lock: {e}"))),
+                Err(_) => Err(not_delivered(
                     "the screen saver did not answer Lock".to_string(),
                 )),
             }
         })
+        .map_err(|e| not_delivered(format!("the screen-saver lock could not be attempted: {e}")))?
     }
 
     /// Lock through `loginctl lock-session` (the CLI fallback tier).
@@ -231,31 +247,46 @@ impl LinuxSessionManager {
     /// discovered. It is the tier that still works when the desktop runs no
     /// screen saver service at all.
     fn lock_via_loginctl(&self) -> Result<(), UdaError> {
-        let status = Command::new("loginctl").arg("lock-session").status();
+        // The spawn is bounded by `COMMAND_TIMEOUT` like every other CLI tier
+        // (P0-3): a wedged loginctl is killed and reported undelivered
+        // instead of pinning the caller forever.
+        let status = crate::sync::run_async(async {
+            let mut child = tokio::process::Command::new("loginctl")
+                .arg("lock-session")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .map_err(map_loginctl_spawn)?;
+
+            match tokio::time::timeout(COMMAND_TIMEOUT, child.wait()).await {
+                Ok(Ok(status)) => Ok(status),
+                Ok(Err(e)) => Err(map_loginctl_spawn(e)),
+                Err(_) => {
+                    let _ = child.start_kill();
+                    Err(not_delivered(format!(
+                        "loginctl lock-session did not answer within {COMMAND_TIMEOUT:?}"
+                    )))
+                }
+            }
+        })
+        .map_err(|e| not_delivered(format!("the loginctl lock could not be attempted: {e}")))?;
 
         match status {
             Ok(status) if status.success() => {
                 log::debug!("loginctl lock-session succeeded");
                 Ok(())
             }
-            Ok(status) => Err(UdaError::CommandFailed(format!(
-                "loginctl lock-session exited with {}",
-                status.code().unwrap_or(-1)
-            ))),
-            Err(e) => Err(UdaError::Io(e)),
+            Ok(status) => Err(map_loginctl_exit(status.code())),
+            Err(e) => Err(e),
         }
     }
 
     /// End the calling user's session.
     fn logout(&self) -> Result<(), UdaError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| UdaError::Internal(format!("could not start a runtime: {e}")))?;
-
         // `TerminateSession("")` means "the calling session", so no session id
         // has to be enumerated first.
-        let logind = runtime.block_on(async {
+        let logind = crate::sync::run_async(async {
             let connection = Self::system_connection().await?;
 
             let proxy = tokio::time::timeout(
@@ -263,52 +294,33 @@ impl LinuxSessionManager {
                 zbus::Proxy::new(&connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE),
             )
             .await
-            .map_err(|_| {
-                UdaError::CommandFailed("building the logind proxy timed out".to_string())
-            })?
-            .map_err(|e| UdaError::DetectionFailed(format!("logind proxy: {e}")))?;
+            .map_err(|_| not_delivered("building the logind proxy timed out".to_string()))?
+            .map_err(|e| not_delivered(format!("logind proxy: {e}")))?;
 
             tokio::time::timeout(
                 DBUS_TIMEOUT,
                 proxy.call::<&str, (&str,), ()>("TerminateSession", &("",)),
             )
             .await
-            .map_err(|_| UdaError::CommandFailed("logind TerminateSession timed out".to_string()))?
+            .map_err(|_| not_delivered("logind TerminateSession timed out".to_string()))?
             .map_err(|e| map_login1_error("TerminateSession", &e.to_string()))
-        });
+        })
+        .map_err(|e| not_delivered(format!("the logind logout could not be attempted: {e}")))?;
 
         match logind {
             Ok(()) => Ok(()),
             Err(logind_error) => {
                 // Tier 3: ask the desktop's own session manager. GNOME, KDE and
-                // XFCE each expose a logout entry point under a different name,
-                // and all three are tried because `$XDG_CURRENT_DESKTOP` is not
-                // reliable enough to pick one.
+                // XFCE each expose a logout entry point under a different name
+                // *and* a different wire signature, so the candidates carry
+                // their arguments (P1-19); all three are tried because
+                // `$XDG_CURRENT_DESKTOP` is not reliable enough to pick one.
                 log::debug!(
                     "logind logout failed ({logind_error}); trying the desktop session manager"
                 );
 
-                for (service, path, interface, method) in [
-                    (
-                        "org.gnome.SessionManager",
-                        "/org/gnome/SessionManager",
-                        "org.gnome.SessionManager",
-                        "Logout",
-                    ),
-                    (
-                        "org.kde.Shutdown",
-                        "/Shutdown",
-                        "org.kde.Shutdown",
-                        "logout",
-                    ),
-                    (
-                        "org.xfce.Session.Manager",
-                        "/org/xfce/Session/Manager",
-                        "org.xfce.Session.Manager",
-                        "Logout",
-                    ),
-                ] {
-                    if logout_via_desktop(service, path, interface, method) {
+                for candidate in LOGOUT_CANDIDATES {
+                    if logout_via_desktop(*candidate) {
                         return Ok(());
                     }
                 }
@@ -319,52 +331,135 @@ impl LinuxSessionManager {
     }
 }
 
+/// One desktop session manager's logout entry point, with the exact wire
+/// signature of its method (P1-19: a single shared argument list cannot satisfy
+/// all three interfaces - KDE takes none and XFCE takes two booleans, so a
+/// uniform `(0u32,)` body always came back as `InvalidArgs`).
+///
+/// `Copy`, and every field is `'static`, so a candidate can travel into the
+/// future [`logout_via_desktop`] hands to `crate::sync::run_async`.
+#[derive(Clone, Copy)]
+struct LogoutCandidate {
+    service: &'static str,
+    path: &'static str,
+    interface: &'static str,
+    method: &'static str,
+    args: LogoutArgs,
+}
+
+/// The typed argument lists the three logout entry points accept.
+#[derive(Clone, Copy)]
+enum LogoutArgs {
+    /// GNOME `org.gnome.SessionManager.Logout(u mode)`: mode 0 asks for a
+    /// normal, user-confirmed logout.
+    Gnome(u32),
+    /// KDE `org.kde.Shutdown.logout()` takes no arguments at all.
+    Kde,
+    /// XFCE `org.xfce.Session.Manager.Logout(bb)`.
+    Xfce(bool, bool),
+}
+
+/// The Tier-3 logout candidates, in try order.
+const LOGOUT_CANDIDATES: &[LogoutCandidate] = &[
+    LogoutCandidate {
+        service: "org.gnome.SessionManager",
+        path: "/org/gnome/SessionManager",
+        interface: "org.gnome.SessionManager",
+        method: "Logout",
+        args: LogoutArgs::Gnome(0),
+    },
+    LogoutCandidate {
+        service: "org.kde.Shutdown",
+        path: "/Shutdown",
+        interface: "org.kde.Shutdown",
+        method: "logout",
+        args: LogoutArgs::Kde,
+    },
+    LogoutCandidate {
+        service: "org.xfce.SessionManager",
+        path: "/org/xfce/SessionManager",
+        interface: "org.xfce.Session.Manager",
+        method: "Logout",
+        // Upstream signature is `Logout(allow_save: b, arbitrary: b)`.
+        // `allow_save = true` keeps the session-save option the desktop's own
+        // logout dialog offers a user; `arbitrary = false` requests a normal
+        // logout instead of forcing one past the session manager's checks.
+        args: LogoutArgs::Xfce(true, false),
+    },
+];
+
 /// Try one desktop session manager's logout entry point.
 ///
 /// A service that is not running is the normal case (only one desktop is ever
 /// present), so a missing service is `false` rather than an error - the caller
 /// keeps trying the next candidate and only reports an error when all of them
 /// fail.
-fn logout_via_desktop(service: &str, path: &str, interface: &str, method: &str) -> bool {
-    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return false;
-    };
+fn logout_via_desktop(candidate: LogoutCandidate) -> bool {
+    crate::sync::run_async(async move {
+        let LogoutCandidate {
+            service,
+            path,
+            interface,
+            method,
+            args,
+        } = candidate;
 
-    let connection = match runtime.block_on(Connection::session()) {
-        Ok(connection) => connection,
-        Err(_) => return false,
-    };
+        let connection = match tokio::time::timeout(DBUS_TIMEOUT, Connection::session()).await {
+            Ok(Ok(connection)) => connection,
+            Ok(Err(e)) => {
+                log::debug!("no session bus for {service}: {e}");
+                return false;
+            }
+            Err(_) => {
+                log::debug!("connecting to the session bus timed out for {service}");
+                return false;
+            }
+        };
 
-    let proxy = runtime.block_on(async {
-        tokio::time::timeout(
+        let Ok(Ok(proxy)) = tokio::time::timeout(
             DBUS_TIMEOUT,
             zbus::Proxy::new(&connection, service, path, interface),
         )
         .await
-    });
+        else {
+            return false;
+        };
 
-    let Ok(Ok(proxy)) = proxy else {
-        return false;
-    };
+        // Each interface disagrees about the Logout signature, so the argument
+        // tuple comes from the candidate instead of being shared.
+        let call = match args {
+            LogoutArgs::Gnome(mode) => {
+                tokio::time::timeout(
+                    DBUS_TIMEOUT,
+                    proxy.call::<&str, (u32,), ()>(method, &(mode,)),
+                )
+                .await
+            }
+            LogoutArgs::Kde => {
+                tokio::time::timeout(DBUS_TIMEOUT, proxy.call::<&str, (), ()>(method, &())).await
+            }
+            LogoutArgs::Xfce(allow_save, arbitrary) => {
+                tokio::time::timeout(
+                    DBUS_TIMEOUT,
+                    proxy.call::<&str, (bool, bool), ()>(method, &(allow_save, arbitrary)),
+                )
+                .await
+            }
+        };
 
-    let call = runtime.block_on(async {
-        tokio::time::timeout(DBUS_TIMEOUT, proxy.call::<&str, (u32,), ()>(method, &(0,))).await
-    });
-
-    match call {
-        Ok(Ok(())) => true,
-        Ok(Err(e)) => {
-            log::debug!("{service} refused {method}: {e}");
-            false
+        match call {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                log::debug!("{service} refused {method}: {e}");
+                false
+            }
+            Err(_) => {
+                log::debug!("{service} did not answer {method} in time");
+                false
+            }
         }
-        Err(_) => {
-            log::debug!("{service} did not answer {method} in time");
-            false
-        }
-    }
+    })
+    .unwrap_or(false)
 }
 
 /// Translate a logind D-Bus error into a typed [`UdaError`].
@@ -372,26 +467,291 @@ fn logout_via_desktop(service: &str, path: &str, interface: &str, method: &str) 
 /// logind reports "not authorised" as `org.freedesktop.DBus.Error.AccessDenied`,
 /// `NotAuthorized`, or polkit's `InteractiveAuthorizationRequired` when the rule
 /// wants a dialog the caller cannot show. "This machine cannot do it" arrives as
-/// `org.freedesktop.systemd1.NoSuchOperation` or a plain `Failed`. Mapping those
-/// separately lets a caller show "ask your administrator" instead of a generic
-/// failure, which matters because power actions are exactly where users hit
-/// polkit.
+/// `org.freedesktop.systemd1.NoSuchOperation` or a plain `Failed`. The case
+/// distinction lives in the message so a caller can show "ask your
+/// administrator" instead of a generic failure, which matters because power
+/// actions are exactly where users hit polkit.
+///
+/// Every outcome - polkit refusal, "this machine cannot", or a plain failure -
+/// maps to [`UdaError::NotSupported`] via [`not_delivered`], so one status
+/// comparison in a host catches all of them; only the message distinguishes
+/// the cases.
 ///
 /// The error is taken as already-rendered text so the classification is a pure
 /// function over a string: unit-testable, and free of any assumption about how
 /// the D-Bus library formats a method error.
 fn map_login1_error(method: &str, text: &str) -> UdaError {
     if error_is_authorization(text) {
-        return UdaError::NotSupported(format!(
+        return not_delivered(format!(
             "logind refused {method}: the caller is not authorised (polkit)"
         ));
     }
 
     if text.contains("NoSuchOperation") || text.contains("NotSupported") {
-        return UdaError::NotSupported(format!("logind cannot {method} on this machine: {text}"));
+        return not_delivered(format!("logind cannot {method} on this machine: {text}"));
     }
 
-    UdaError::CommandFailed(format!("logind {method} failed: {text}"))
+    not_delivered(format!("logind {method} failed: {text}"))
+}
+
+/// Translate a failed `loginctl lock-session` run into the contract error.
+///
+/// A nonzero exit is an attempted action the CLI refused (the WSL case): the
+/// host must see `UDA_ERR_NOT_SUPPORTED`, with the exit code kept in the
+/// message for diagnosis.
+fn map_loginctl_exit(code: Option<i32>) -> UdaError {
+    not_delivered(format!(
+        "loginctl lock-session exited with {}",
+        code.unwrap_or(-1)
+    ))
+}
+
+/// Translate a `loginctl` spawn failure into the contract error.
+///
+/// A missing `loginctl` means the CLI tier cannot deliver at all, so it folds
+/// into the same contract error as a refused run; the OS error stays in the
+/// message.
+fn map_loginctl_spawn(error: std::io::Error) -> UdaError {
+    not_delivered(format!("could not run loginctl: {error}"))
+}
+
+/// The single error an attempted session action may report when it cannot
+/// deliver.
+///
+/// `include/uda.h` promises C hosts that an attempted `uda_session_*` action
+/// which is not delivered fails with `UDA_ERR_NOT_SUPPORTED` and nothing else,
+/// so one status comparison is enough to degrade. Every failure path in this
+/// module funnels through this constructor, directly or through
+/// [`map_login1_error`] and the `loginctl` mappers, which makes that promise
+/// hold by construction; the diagnostic always stays in the message.
+fn not_delivered(detail: impl std::fmt::Display) -> UdaError {
+    UdaError::NotSupported(detail.to_string())
+}
+
+/// Independent receivers for each class of session action.
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionReachability {
+    logind: bool,
+    lock_auto: bool,
+    logout_self: bool,
+    screen_saver: bool,
+    desktop_logout: bool,
+}
+
+/// Probe once per process; failures leave only the affected receiver absent.
+///
+/// Every receiver is independent, so they are all probed concurrently and every
+/// underlying D-Bus await is bounded by `DBUS_TIMEOUT`. The logind session
+/// lookup is gated on the presence answer, so the first
+/// [`SessionManager::capabilities`] call pays the presence probe plus the
+/// session lookup in the worst case (about 35 seconds), not four serial waits;
+/// a receiver that fails or times out loses only its own result.
+fn session_reachability() -> SessionReachability {
+    static REACHABLE: OnceLock<SessionReachability> = OnceLock::new();
+    *REACHABLE.get_or_init(|| match crate::sync::run_async(probe_receivers()) {
+        Ok(reachability) => reachability,
+        Err(error) => {
+            // The bridge itself could not run the probes; every receiver
+            // stays unclaimed rather than guessing.
+            log::debug!("the session reachability probes could not run: {error}");
+            SessionReachability::default()
+        }
+    })
+}
+
+/// Run the four receiver probes concurrently and compose the same verdict the
+/// former sequential probe produced.
+///
+/// The session queries are gated on the actual logind answer through a one-shot
+/// channel: [`logind_sessions_present`] would otherwise hit the system bus (and
+/// could activate a logind that was not running) even when [`logind_present`]
+/// said there is none. Awaiting the channel does not serialize the other
+/// receivers - they are already in flight. Every underlying D-Bus await keeps
+/// its own `DBUS_TIMEOUT`, so a slow receiver affects only its own result.
+async fn probe_receivers() -> SessionReachability {
+    let (logind_sender, logind_receiver) = tokio::sync::oneshot::channel();
+
+    let logind = async move {
+        let presence = logind_present().await;
+        // Publishes the actual answer, so the session probe never queries a
+        // service that is not running. A dropped receiver is harmless.
+        let _ = logind_sender.send(matches!(presence, Ok(true)));
+        presence
+    };
+    let sessions = async move {
+        match logind_receiver.await {
+            // Only a logind that is really running is asked for its sessions.
+            Ok(true) => logind_sessions_present().await,
+            // Absent, or the logind probe was dropped before answering: there
+            // is no manager to list sessions from.
+            Ok(false) | Err(_) => Ok((false, false)),
+        }
+    };
+
+    // `join!` keeps all four in flight on one task. The presence and session
+    // probes are sequential by design (the latter is gated on the former), but
+    // the logout-manager and screen-saver probes run alongside both.
+    let (logind, sessions, desktop_logout, screen_saver) = tokio::join!(
+        logind,
+        sessions,
+        desktop_logout_manager_present(),
+        screensaver_present(),
+    );
+
+    let logind = reachable_or_absent(logind, "logind");
+    // An absent manager cannot answer the session queries; the gated probe
+    // above already returns `(false, false)` in that case, and a `false`
+    // logind collapses the answer the same way the sequential probe did.
+    let (lock_auto, logout_self) = if logind {
+        match sessions {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                log::debug!("logind session probes did not answer: {error}");
+                (false, false)
+            }
+        }
+    } else {
+        (false, false)
+    };
+    // A desktop logout manager only becomes the logout receiver when the
+    // caller's own session is not reachable, exactly as before.
+    let desktop_logout =
+        !logout_self && reachable_or_absent(desktop_logout, "desktop logout managers");
+    let screen_saver = reachable_or_absent(screen_saver, "screen saver");
+    SessionReachability {
+        logind,
+        lock_auto,
+        logout_self,
+        screen_saver,
+        desktop_logout,
+    }
+}
+
+/// `auto` can use the user's display session; `""` requires the caller's own.
+/// Both probes share a connection and listing, and are issued concurrently, but
+/// fail independently.
+async fn logind_sessions_present() -> Result<(bool, bool), UdaError> {
+    let connection = LinuxSessionManager::system_connection().await?;
+    logind_sessions_on(&connection).await
+}
+
+async fn logind_sessions_on(connection: &Connection) -> Result<(bool, bool), UdaError> {
+    let proxy = tokio::time::timeout(
+        DBUS_TIMEOUT,
+        zbus::Proxy::new(connection, LOGIN1_SERVICE, LOGIN1_PATH, LOGIN1_INTERFACE),
+    )
+    .await
+    .map_err(|_| not_delivered("building the logind session proxy timed out".to_string()))?
+    .map_err(|error| not_delivered(format!("the logind manager proxy: {error}")))?;
+    let sessions: Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)> =
+        match tokio::time::timeout(DBUS_TIMEOUT, proxy.call("ListSessions", &())).await {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(error)) => return Err(not_delivered(format!("ListSessions failed: {error}"))),
+            Err(_) => return Err(not_delivered("ListSessions timed out".to_string())),
+        };
+    if sessions.is_empty() {
+        return Ok((false, false));
+    }
+    // Both calls share the proxy; each keeps its own `DBUS_TIMEOUT`, and
+    // issuing them together halves the wait when both are slow.
+    let (lock_auto, logout_self) = tokio::join!(
+        logind_session_resolves(&proxy, "auto"),
+        logind_session_resolves(&proxy, ""),
+    );
+    Ok((lock_auto, logout_self))
+}
+
+async fn logind_session_resolves(proxy: &zbus::Proxy<'_>, id: &str) -> bool {
+    match tokio::time::timeout(
+        DBUS_TIMEOUT,
+        proxy.call::<_, (&str,), zbus::zvariant::OwnedObjectPath>("GetSession", &(id,)),
+    )
+    .await
+    {
+        Ok(Ok(_)) => true,
+        Ok(Err(error)) => {
+            log::debug!("logind cannot resolve session {id:?}: {error}");
+            false
+        }
+        Err(_) => {
+            log::debug!("GetSession({id:?}) timed out after {DBUS_TIMEOUT:?}");
+            false
+        }
+    }
+}
+
+/// Owned or activatable desktop logout managers are potential receivers.
+/// Listing names never activates a service or calls its logout method.
+async fn desktop_logout_manager_present() -> Result<bool, UdaError> {
+    let connection = LinuxSessionManager::session_connection().await?;
+    desktop_logout_manager_on(&connection).await
+}
+
+async fn desktop_logout_manager_on(connection: &Connection) -> Result<bool, UdaError> {
+    let proxy = crate::internal_dbus(
+        "building the desktop logout bus proxy",
+        zbus::fdo::DBusProxy::new(connection),
+    )
+    .await?;
+    let owned = desktop_bus_names(&proxy, "ListNames").await;
+    let activatable = desktop_bus_names(&proxy, "ListActivatableNames").await;
+    Ok(LOGOUT_CANDIDATES.iter().any(|candidate| {
+        owned
+            .iter()
+            .chain(&activatable)
+            .any(|name| name == candidate.service)
+    }))
+}
+
+/// A failed listing cannot erase names proven by the other listing.
+async fn desktop_bus_names(proxy: &zbus::fdo::DBusProxy<'_>, method: &str) -> Vec<String> {
+    match tokio::time::timeout(
+        DBUS_TIMEOUT,
+        proxy.inner().call::<_, (), Vec<String>>(method, &()),
+    )
+    .await
+    {
+        Ok(Ok(names)) => names,
+        Ok(Err(error)) => {
+            log::debug!("{method} failed while probing desktop logout managers: {error}");
+            Vec::new()
+        }
+        Err(_) => {
+            log::debug!("{method} timed out while probing desktop logout managers");
+            Vec::new()
+        }
+    }
+}
+
+/// Collapse a concurrent probe's answer into a plain bool.
+///
+/// A probe that fails on the bus means the same thing as "the receiver is not
+/// proven present", so the error is logged for diagnostics and collapses to
+/// `false`, matching the wake-lock backend's fold.
+fn reachable_or_absent(probe: Result<bool, UdaError>, receiver: &str) -> bool {
+    match probe {
+        Ok(reachable) => reachable,
+        Err(error) => {
+            log::debug!("the {receiver} reachability probe did not answer: {error}");
+            false
+        }
+    }
+}
+
+/// Each capability follows the receiver targeted by its execution path.
+fn session_capability_set(receivers: SessionReachability) -> Capability {
+    let mut capabilities = Capability::empty();
+    if receivers.logind {
+        capabilities |=
+            Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
+    }
+    if receivers.logout_self || receivers.desktop_logout {
+        capabilities |= Capability::SESSION_MANAGEMENT | Capability::LOGOUT;
+    }
+    if receivers.lock_auto || receivers.screen_saver {
+        capabilities |= Capability::LOCK;
+    }
+    capabilities
 }
 
 impl SessionManager for LinuxSessionManager {
@@ -430,18 +790,12 @@ impl SessionManager for LinuxSessionManager {
     }
 
     fn capabilities(&self) -> Capability {
-        // Every action routes through logind, which is present on any machine
-        // with systemd; whether logind *authorises* the caller is a runtime
-        // question answered by the methods above, not a capability question.
-        // `LOCK` is also advertised unconditionally because the `loginctl`
-        // fallback needs no screen saver service at all.
-        Capability::SESSION_MANAGEMENT
-            | Capability::LOCK
-            | Capability::LOGOUT
-            | Capability::SUSPEND
-            | Capability::HIBERNATE
-            | Capability::REBOOT
-            | Capability::SHUTDOWN
+        // Probed, not hardcoded: a sandbox without a system manager answers
+        // with nothing, and a manager without a seat session (systemd-enabled
+        // WSL2) answers with the power actions alone. Whether logind
+        // *authorises* the caller remains a runtime question for the methods
+        // above, not a capability question.
+        session_capability_set(session_reachability())
     }
 }
 
@@ -463,9 +817,8 @@ pub(crate) fn method_for(action: SessionAction) -> Option<&'static str> {
 
 /// Whether a logind error text means "not authorised".
 ///
-/// Split out from [`map_login1_error`] so the CLI tier and the D-Bus tier make
-/// the same distinction.
-#[allow(dead_code)] // shared classification helper, kept next to its only caller
+/// Split out from [`map_login1_error`] so the classification rule stays
+/// unit-testable without a bus.
 pub(crate) fn error_is_authorization(text: &str) -> bool {
     // `AccessDenied` is D-Bus's generic refusal and `NotAuthorized` is what
     // logind itself emits. `InteractiveAuthorizationRequired` is polkit's answer
@@ -503,6 +856,39 @@ mod tests {
         // `PowerOff` is the logind name; there is no `Shutdown` method, and
         // sending one would surface as an UnknownMethod error.
         assert_ne!(method_for(SessionAction::Shutdown), Some("Shutdown"));
+    }
+
+    #[test]
+    fn the_xfce_candidate_uses_the_upstream_service_name_and_path() {
+        // The Tier-3 fallback used to dial `org.xfce.Session.Manager` /
+        // `/org/xfce/Session/Manager`, which no service publishes (P1-19).
+        let xfce = LOGOUT_CANDIDATES
+            .iter()
+            .find(|candidate| candidate.service.starts_with("org.xfce"))
+            .expect("the XFCE candidate is part of the table");
+
+        assert_eq!(xfce.service, "org.xfce.SessionManager");
+        assert_eq!(xfce.path, "/org/xfce/SessionManager");
+        assert_eq!(xfce.interface, "org.xfce.Session.Manager");
+        assert_eq!(xfce.method, "Logout");
+    }
+
+    #[test]
+    fn every_logout_candidate_carries_its_own_wire_signature() {
+        // GNOME `Logout(u)`, KDE `logout()`, XFCE `Logout(bb)`: a uniform
+        // `(0u32,)` body made every non-GNOME candidate fail with InvalidArgs.
+        let [gnome, kde, xfce] = LOGOUT_CANDIDATES else {
+            panic!("the candidate table has exactly three entries");
+        };
+
+        assert_eq!(gnome.service, "org.gnome.SessionManager");
+        assert!(matches!(gnome.args, LogoutArgs::Gnome(0)));
+
+        assert_eq!(kde.service, "org.kde.Shutdown");
+        assert_eq!(kde.method, "logout");
+        assert!(matches!(kde.args, LogoutArgs::Kde));
+
+        assert!(matches!(xfce.args, LogoutArgs::Xfce(true, false)));
     }
 
     #[test]
@@ -544,16 +930,556 @@ mod tests {
     }
 
     #[test]
-    fn a_generic_failure_is_a_command_failure() {
+    fn a_generic_failure_is_still_an_undelivered_attempt() {
+        // Whatever logind answered, a host that checks
+        // `status == UDA_ERR_NOT_SUPPORTED` must catch it, so even a plain
+        // failure folds into NotSupported; the reason stays in the message.
         let error = map_login1_error("Suspend", "device busy");
 
-        assert!(matches!(error, UdaError::CommandFailed(_)));
+        match error {
+            UdaError::NotSupported(message) => {
+                assert!(message.contains("Suspend"), "message: {message}");
+                assert!(message.contains("device busy"), "message: {message}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
     }
 
     #[test]
-    fn capabilities_cover_every_action() {
-        let manager = LinuxSessionManager::new();
-        let capabilities = manager.capabilities();
+    fn every_session_attempt_failure_is_not_supported() {
+        // The C-ABI contract (include/uda.h, `uda_session_*`): an action that
+        // was attempted but not delivered answers UDA_ERR_NOT_SUPPORTED and
+        // nothing else, so one comparison degrades a host. Every mapping this
+        // module can produce for an attempt is enumerated here; a new failure
+        // path must route through one of them (or `not_delivered` itself).
+        let attempt_failures = [
+            not_delivered("anything at all"),
+            map_login1_error("Suspend", "device busy"),
+            map_login1_error(
+                "PowerOff",
+                "org.freedesktop.DBus.Error.AccessDenied: not authorised",
+            ),
+            map_login1_error("Hibernate", "org.freedesktop.systemd1.NoSuchOperation"),
+            map_loginctl_exit(Some(1)),
+            map_loginctl_exit(None),
+            map_loginctl_spawn(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such file",
+            )),
+        ];
+
+        for error in attempt_failures {
+            assert!(
+                matches!(error, UdaError::NotSupported(_)),
+                "an attempted session action must report NotSupported, got {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_loginctl_exit_message_keeps_the_diagnostic() {
+        // The WSL reproduction: `loginctl lock-session` exiting 1 must surface
+        // as UDA_ERR_NOT_SUPPORTED (-2), which include/uda.h promises, not as
+        // a generic internal error (-5).
+        let error = map_loginctl_exit(Some(1));
+
+        match error {
+            UdaError::NotSupported(message) => {
+                assert!(
+                    message.contains("loginctl lock-session exited with 1"),
+                    "message: {message}"
+                );
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_loginctl_spawn_failure_keeps_the_os_error() {
+        let error = map_loginctl_spawn(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no such file",
+        ));
+
+        match error {
+            UdaError::NotSupported(message) => {
+                assert!(message.contains("loginctl"), "message: {message}");
+                assert!(message.contains("no such file"), "message: {message}");
+            }
+            other => panic!("expected NotSupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn independent_receiver_matrix_preserves_each_action_boundary() {
+        let power =
+            Capability::SUSPEND | Capability::HIBERNATE | Capability::REBOOT | Capability::SHUTDOWN;
+        for logind in [false, true] {
+            for lock_auto in [false, true] {
+                for logout_self in [false, true] {
+                    for screen_saver in [false, true] {
+                        for desktop_logout in [false, true] {
+                            let caps = session_capability_set(SessionReachability {
+                                logind,
+                                lock_auto,
+                                logout_self,
+                                screen_saver,
+                                desktop_logout,
+                            });
+                            assert_eq!(caps.intersects(power), logind);
+                            assert_eq!(caps.contains(power), logind);
+                            assert_eq!(caps.contains(Capability::LOCK), lock_auto || screen_saver);
+                            assert_eq!(
+                                caps.contains(Capability::LOGOUT),
+                                logout_self || desktop_logout
+                            );
+                            assert_eq!(
+                                caps.contains(Capability::SESSION_MANAGEMENT),
+                                logout_self || desktop_logout
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn display_session_alone_does_not_pass_the_core_logout_guard() {
+        struct RecordingManager {
+            capabilities: Capability,
+            logout_called: std::cell::Cell<bool>,
+        }
+        impl SessionManager for RecordingManager {
+            fn capabilities(&self) -> Capability {
+                self.capabilities
+            }
+            fn logout(&self) -> Result<(), UdaError> {
+                self.logout_called.set(true);
+                Ok(())
+            }
+            fn lock(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn suspend(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn hibernate(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn reboot(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+            fn shutdown(&self) -> Result<(), UdaError> {
+                Ok(())
+            }
+        }
+        let manager = RecordingManager {
+            capabilities: session_capability_set(SessionReachability {
+                logind: true,
+                lock_auto: true,
+                ..SessionReachability::default()
+            }),
+            logout_called: std::cell::Cell::new(false),
+        };
+        assert!(matches!(
+            uda_core::session::perform(&manager, SessionAction::Logout),
+            Err(UdaError::NotSupported(_))
+        ));
+        assert!(!manager.logout_called.get());
+        assert!(uda_core::session::perform(&manager, SessionAction::Lock).is_ok());
+    }
+
+    /// Each fixture starts its own bus and uses explicit addresses. It cannot
+    /// reach the host's system/session bus or leak global environment changes.
+    struct IsolatedBus {
+        child: std::process::Child,
+        directory: std::path::PathBuf,
+        address: String,
+    }
+
+    impl IsolatedBus {
+        fn start(kde_activatable: bool) -> Self {
+            use std::io::BufRead as _;
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let directory = std::env::temp_dir().join(format!(
+                "uda-session-mock-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&directory).expect("create isolated bus fixture");
+            if kde_activatable {
+                std::fs::write(
+                    directory.join("org.kde.Shutdown.service"),
+                    format!(
+                        "[D-BUS Service]\nName=org.kde.Shutdown\nExec=/usr/bin/touch {}\n",
+                        directory.join("activated").display()
+                    ),
+                )
+                .expect("write activation fixture");
+            }
+            let config = directory.join("bus.conf");
+            std::fs::write(&config, format!(
+                "<busconfig><type>session</type><listen>unix:tmpdir={}</listen><auth>EXTERNAL</auth><servicedir>{}</servicedir><policy context=\"default\"><allow send_destination=\"*\"/><allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>",
+                directory.display(), directory.display()))
+                .expect("write isolated bus configuration");
+            let mut child = std::process::Command::new("dbus-daemon")
+                .arg("--nofork")
+                .arg("--print-address=1")
+                .arg(format!("--config-file={}", config.display()))
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("dbus-daemon is required for isolated session mocks");
+            let stdout = child.stdout.take().expect("daemon address pipe");
+            let mut address = String::new();
+            std::io::BufReader::new(stdout)
+                .read_line(&mut address)
+                .expect("read bus address");
+            let fixture = Self {
+                child,
+                directory,
+                address: address.trim().to_string(),
+            };
+            assert!(
+                !fixture.address.is_empty(),
+                "isolated daemon did not publish an address"
+            );
+            fixture
+        }
+
+        async fn connect(&self) -> Connection {
+            zbus::connection::Builder::address(self.address.as_str())
+                .expect("isolated bus address")
+                .build()
+                .await
+                .expect("connect to isolated bus")
+        }
+    }
+
+    impl Drop for IsolatedBus {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    type MockSessions = Vec<(String, u32, String, String, zbus::zvariant::OwnedObjectPath)>;
+
+    struct MockLogin1 {
+        auto: bool,
+        caller_self: bool,
+        calls: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.login1.Manager")]
+    impl MockLogin1 {
+        fn list_sessions(&self) -> MockSessions {
+            vec![(
+                "display".to_string(),
+                1000,
+                "mock".to_string(),
+                "seat0".to_string(),
+                zbus::zvariant::OwnedObjectPath::try_from(
+                    "/org/freedesktop/login1/session/display",
+                )
+                .expect("valid mock path"),
+            )]
+        }
+
+        fn get_session(&self, id: &str) -> zbus::fdo::Result<zbus::zvariant::OwnedObjectPath> {
+            self.calls
+                .lock()
+                .expect("mock calls lock")
+                .push(id.to_string());
+            let resolves = match id {
+                "auto" => self.auto,
+                "" => self.caller_self,
+                _ => false,
+            };
+            if resolves {
+                Ok(zbus::zvariant::OwnedObjectPath::try_from(
+                    "/org/freedesktop/login1/session/display",
+                )
+                .expect("valid mock path"))
+            } else {
+                Err(zbus::fdo::Error::Failed(
+                    "no session for requested selector".to_string(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_logind_probes_use_auto_and_empty_id_independently() {
+        for (auto, caller_self) in [(true, false), (false, true), (true, true), (false, false)] {
+            let fixture = IsolatedBus::start(false);
+            let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let _server = zbus::connection::Builder::address(fixture.address.as_str())
+                .expect("mock bus address")
+                .name(LOGIN1_SERVICE)
+                .expect("mock service name")
+                .serve_at(
+                    LOGIN1_PATH,
+                    MockLogin1 {
+                        auto,
+                        caller_self,
+                        calls: calls.clone(),
+                    },
+                )
+                .expect("mock logind interface")
+                .build()
+                .await
+                .expect("start mock logind");
+            let client = fixture.connect().await;
+            assert_eq!(
+                logind_sessions_on(&client).await.expect("session probes"),
+                (auto, caller_self)
+            );
+            // Both `GetSession` calls are issued concurrently, so the recorded
+            // order is not deterministic; compare the set they form instead.
+            let mut recorded = calls.lock().expect("mock calls lock").clone();
+            recorded.sort();
+            assert_eq!(recorded, vec!["", "auto"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_desktop_probe_finds_owned_and_activatable_names_without_activation() {
+        let fixture = IsolatedBus::start(true);
+        let client = fixture.connect().await;
+        let bus = zbus::fdo::DBusProxy::new(&client)
+            .await
+            .expect("mock daemon proxy");
+        assert!(!bus
+            .name_has_owner("org.kde.Shutdown".try_into().expect("KDE name"))
+            .await
+            .expect("check KDE ownership"));
+        assert!(desktop_logout_manager_on(&client)
+            .await
+            .expect("probe activatable KDE"));
+        assert!(!bus
+            .name_has_owner("org.kde.Shutdown".try_into().expect("KDE name"))
+            .await
+            .expect("discovery must not activate KDE"));
+        assert!(!fixture.directory.join("activated").exists());
+
+        let empty = IsolatedBus::start(false);
+        let client = empty.connect().await;
+        let owner = empty.connect().await;
+        assert!(!desktop_logout_manager_on(&client)
+            .await
+            .expect("empty desktop bus"));
+        owner
+            .request_name("org.kde.Shutdown.Other")
+            .await
+            .expect("unrelated service name");
+        assert!(!desktop_logout_manager_on(&client)
+            .await
+            .expect("exact name matching"));
+        owner
+            .request_name("org.kde.Shutdown")
+            .await
+            .expect("owned KDE name");
+        assert!(desktop_logout_manager_on(&client)
+            .await
+            .expect("owned KDE receiver"));
+    }
+
+    #[test]
+    fn a_live_logind_session_advertises_the_full_set() {
+        // Logind receives every power action, and with a live seat session
+        // the session objects receive the session-management ones, so both
+        // quadrants with a live session claim all seven bits.
+        for screen_saver in [true, false] {
+            let capabilities = session_capability_set(SessionReachability {
+                logind: true,
+                lock_auto: true,
+                logout_self: true,
+                screen_saver,
+                desktop_logout: false,
+            });
+
+            assert!(
+                capabilities.contains(Capability::SESSION_MANAGEMENT),
+                "a live logind session (screen saver: {screen_saver}) must claim \
+                 SESSION_MANAGEMENT"
+            );
+            for action in [
+                SessionAction::Lock,
+                SessionAction::Logout,
+                SessionAction::Suspend,
+                SessionAction::Hibernate,
+                SessionAction::Reboot,
+                SessionAction::Shutdown,
+            ] {
+                assert!(
+                    capabilities.contains(action.capability()),
+                    "{action:?} is not advertised behind a live logind session (screen \
+                     saver: {screen_saver})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn logind_without_a_caller_session_advertises_the_power_actions_alone() {
+        // Owning the bus name only proves the daemon runs: a systemd-enabled
+        // WSL2 install keeps a PTY/SSH session in the list while neither
+        // `loginctl lock-session` nor `TerminateSession("")` can resolve the
+        // calling session, so the session bits stay unadvertised. The
+        // manager-level power actions keep their receiver.
+        let capabilities = session_capability_set(SessionReachability {
+            logind: true,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: false,
+            desktop_logout: false,
+        });
+
+        for action in [
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+        ] {
+            assert!(
+                capabilities.contains(action.capability()),
+                "{action:?} is manager-level and must stay advertised without a session"
+            );
+        }
+        assert!(
+            !capabilities.contains(Capability::SESSION_MANAGEMENT),
+            "no calling session exists to manage"
+        );
+        for action in [SessionAction::Lock, SessionAction::Logout] {
+            assert!(
+                !capabilities.contains(action.capability()),
+                "{action:?} resolves the calling session and must not be advertised"
+            );
+        }
+    }
+
+    #[test]
+    fn logind_without_a_caller_session_still_honours_a_screen_saver_lock() {
+        // The bits compose: `lock()` tries the screen saver before any
+        // `loginctl` call, so a reachable screen saver claims LOCK even when
+        // logind has no session for the caller.
+        let capabilities = session_capability_set(SessionReachability {
+            logind: true,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: true,
+            desktop_logout: false,
+        });
+
+        for action in [
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+            SessionAction::Lock,
+        ] {
+            assert!(
+                capabilities.contains(action.capability()),
+                "{action:?} has a receiver (manager or screen saver) and must be \
+                 advertised"
+            );
+        }
+        assert!(!capabilities.contains(Capability::SESSION_MANAGEMENT));
+        assert!(!capabilities.contains(Capability::LOGOUT));
+    }
+
+    #[test]
+    fn a_screen_saver_without_logind_advertises_lock_alone() {
+        // Without logind the power actions have no receiver at all and the
+        // loginctl CLI tier is gone with it; no desktop logout manager was found. Only the screen-saver lock is
+        // honestly claimable.
+        let capabilities = session_capability_set(SessionReachability {
+            logind: false,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: true,
+            desktop_logout: false,
+        });
+
+        assert_eq!(capabilities, Capability::LOCK);
+        for action in [
+            SessionAction::Logout,
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+        ] {
+            assert!(
+                !capabilities.contains(action.capability()),
+                "{action:?} must not be advertised without logind"
+            );
+        }
+    }
+
+    #[test]
+    fn without_any_receiver_nothing_is_advertised() {
+        // No system manager, no screen saver - a `dbus-run-session` sandbox or
+        // a container - so the answer is the empty set rather than a full
+        // house nothing can deliver.
+        assert!(session_capability_set(SessionReachability {
+            logind: false,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: false,
+            desktop_logout: false
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn a_desktop_session_manager_advertises_logout_without_logind() {
+        // `logout()` falls back to the GNOME/KDE/XFCE managers when the
+        // logind path fails, so a traditional X11 desktop without a logind
+        // seat session still has a working logout, and the bits must say so
+        // instead of greying out a menu entry the desktop can deliver. The
+        // management bit rides along: a session-management backend does
+        // exist. Nothing else has a receiver here.
+        let capabilities = session_capability_set(SessionReachability {
+            logind: false,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: false,
+            desktop_logout: true,
+        });
+
+        assert!(capabilities.contains(Capability::LOGOUT));
+        assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
+        for action in [
+            SessionAction::Lock,
+            SessionAction::Suspend,
+            SessionAction::Hibernate,
+            SessionAction::Reboot,
+            SessionAction::Shutdown,
+        ] {
+            assert!(
+                !capabilities.contains(action.capability()),
+                "{action:?} has no receiver without logind or a screen saver"
+            );
+        }
+    }
+
+    #[test]
+    fn the_receivers_compose_across_buses() {
+        // One host, three disjoint receivers: a logind daemon that cannot
+        // resolve the caller, a reachable screen saver, and a desktop session
+        // manager. Each action's bit follows its own receiver and nothing
+        // else's.
+        let capabilities = session_capability_set(SessionReachability {
+            logind: true,
+            lock_auto: false,
+            logout_self: false,
+            screen_saver: true,
+            desktop_logout: true,
+        });
 
         for action in [
             SessionAction::Lock,
@@ -565,29 +1491,33 @@ mod tests {
         ] {
             assert!(
                 capabilities.contains(action.capability()),
-                "{action:?} is advertised but not reported as a capability"
+                "{action:?} has a receiver (manager, screen saver or desktop \
+                 session manager) and must be advertised"
             );
         }
         assert!(capabilities.contains(Capability::SESSION_MANAGEMENT));
     }
 
     #[test]
-    fn the_core_guard_accepts_every_action_this_backend_advertises() {
-        // The guard and the capability set must agree, otherwise a caller that
-        // checks capabilities first would still be refused at call time.
-        let manager = LinuxSessionManager::new();
-        let capabilities = manager.capabilities();
+    fn a_failed_probe_counts_as_an_absent_receiver() {
+        // Conservative direction: any bus failure collapses to "not proven
+        // present", never to a claim. A failure of the sync bridge itself is
+        // collapsed to the same default by `session_reachability`.
+        assert!(reachable_or_absent(Ok(true), "logind"));
+        assert!(!reachable_or_absent(Ok(false), "logind"));
+        assert!(!reachable_or_absent(
+            Err(UdaError::DetectionFailed("no bus".to_string())),
+            "logind"
+        ));
+    }
 
-        for action in [
-            SessionAction::Lock,
-            SessionAction::Logout,
-            SessionAction::Suspend,
-            SessionAction::Hibernate,
-            SessionAction::Reboot,
-            SessionAction::Shutdown,
-        ] {
-            let would_be_refused = !capabilities.contains(action.capability());
-            assert!(!would_be_refused, "{action:?} would be refused");
-        }
+    #[test]
+    fn the_probed_service_names_are_the_exact_well_known_ones() {
+        // The probe and the Lock proxy both address these services by name,
+        // with exact, case-sensitive matching (pinned by the wake-lock
+        // backend's `bus_names_contain` tests), so the constants must be
+        // spelled exactly as the services publish themselves.
+        assert_eq!(LOGIN1_SERVICE, "org.freedesktop.login1");
+        assert_eq!(SCREENSAVER_SERVICE, "org.freedesktop.ScreenSaver");
     }
 }

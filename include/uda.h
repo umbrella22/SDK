@@ -232,6 +232,76 @@
 #define UDA_SESSION_CAP_SHUTDOWN (1u << 22)
 
 /**
+ * Capability bit: a tray backend exists at all (`SYSTEM_TRAY` in `uda-core`).
+ */
+#define UDA_TRAY_CAP_SYSTEM_TRAY (1 << 7)
+
+/**
+ * Capability bit: the icon can be shown, hidden and swapped at runtime.
+ */
+#define UDA_TRAY_CAP_ICON (1 << 8)
+
+/**
+ * Capability bit: the tray exposes hover text.
+ */
+#define UDA_TRAY_CAP_TOOLTIP (1 << 9)
+
+/**
+ * Capability bit: the tray reports a single primary click.
+ *
+ * Reserved: the C ABI has no click-callback registration, so
+ * `uda_tray_capabilities` always clears this bit. It stays defined for a
+ * future click API; do not infer click events from the bitmask today.
+ */
+#define UDA_TRAY_CAP_CLICK (1 << 10)
+
+/**
+ * Capability bit: the tray reports a native double click (never true on Linux
+ * SNI, where it would have to be synthesised).
+ *
+ * Reserved for the same reason as [`UDA_TRAY_CAP_CLICK`]: the C ABI cannot
+ * register a click callback, so `uda_tray_capabilities` always clears it.
+ */
+#define UDA_TRAY_CAP_DOUBLE_CLICK (1 << 11)
+
+/**
+ * Capability bit: the tray exposes a context menu.
+ */
+#define UDA_TRAY_CAP_CONTEXT_MENU (1 << 12)
+
+/**
+ * Capability bit: menu rows can render a checkbox state.
+ */
+#define UDA_TRAY_CAP_CHECKBOX (1 << 13)
+
+/**
+ * Capability bit: menu rows can be added at runtime; the C ABI does not
+ * expose removal or relabelling (the Rust core supports both).
+ */
+#define UDA_TRAY_CAP_DYNAMIC_MENU (1 << 14)
+
+/**
+ * Support-level code: the backend never claimed a tray at all.
+ *
+ * Unreachable through handles `uda_tray_create` handed out - every created
+ * icon publishes the backend's capability set - but the mapping stays total,
+ * so a fabricated or half-registered icon cannot be read as healthy.
+ */
+#define UDA_TRAY_SUPPORT_LEVEL_NONE 0
+
+/**
+ * Support-level code: the icon is live, but registration recorded a
+ * degradation (on Linux: no `StatusNotifierWatcher`, so the shell may never
+ * display the item). `uda_tray_support_reason` explains it.
+ */
+#define UDA_TRAY_SUPPORT_LEVEL_PARTIAL 1
+
+/**
+ * Support-level code: the icon is live and nothing degraded.
+ */
+#define UDA_TRAY_SUPPORT_LEVEL_FULL 2
+
+/**
  * Callback type for a plain text menu row, or NULL for a silent row.
  *
  * `item_id` is the row's id, as returned by `uda_tray_menu_add_text()`;
@@ -269,11 +339,11 @@ int32_t uda_detect_theme(int32_t *out_theme);
 /**
  * Set the desktop wallpaper.
  *
- * `path` is a null-terminated UTF-8 filesystem path; on Linux a `file://`
- * URI is also accepted, while Windows requires a plain filesystem path. An
- * empty path is rejected as an invalid argument rather than being sent to
- * the backend. `fill_mode` is one of the `UDA_FILL_*` codes; anything else
- * is rejected.
+ * `path` accepts a plain filesystem path on every backend. A `file://` URI is
+ * additionally accepted on GNOME and KDE, which convert it before handing the
+ * value to their shell; other backends (Windows, Hyprland, Sway, X11) require
+ * a path and receive the string unchanged. An empty path is rejected as an
+ * invalid argument rather than being sent to the backend.
  *
  * On failure a negative status code is returned and no wallpaper is changed.
  *
@@ -284,13 +354,198 @@ int32_t uda_detect_theme(int32_t *out_theme);
 int32_t uda_set_wallpaper(const char *path, int32_t fill_mode);
 
 /**
+ * Read the metadata of the active media player.
+ *
+ * The three strings are allocated by Rust and must be released with
+ * [`uda_free_string`]. An unpublished field is written as a null pointer, or
+ * zero for a duration, so each pointer must be checked before it is read. A
+ * field published as an empty string stays an empty C string where the backend
+ * can tell the two apart (Linux); on Windows an empty read also surfaces as
+ * null, because SMTC has no "unset" marker on the wire, so a host must treat
+ * null as "skip this field" everywhere. With no player running every
+ * out-parameter is set to null/zero and [`UDA_OK`] is still returned.
+ *
+ * `out_position_ms` is optional: pass null to skip it.
+ *
+ * # Safety
+ *
+ * `out_title`, `out_artist` and `out_album` must each point at a writable
+ * `char *` location; `out_duration_ms` must point at a writable `uint64_t`;
+ * `out_position_ms` must be null or point at a writable `uint64_t`.
+ */
+int32_t uda_media_get_metadata(char **out_title,
+                               char **out_artist,
+                               char **out_album,
+                               uint64_t *out_duration_ms,
+                               uint64_t *out_position_ms);
+
+/**
+ * Read the playback status of the active media player.
+ *
+ * Writes `UDA_MEDIA_PLAYING`, `UDA_MEDIA_PAUSED`, `UDA_MEDIA_STOPPED` or
+ * `UDA_MEDIA_UNKNOWN` to `*out_status`. `UDA_MEDIA_UNKNOWN` covers both "no
+ * player is running" and "the state could not be determined", and is
+ * reported with [`UDA_OK`]: it is an answer, not a failure. A negative status
+ * code means the backend itself could not be reached: on Linux, connecting to
+ * the session bus or building the player proxy fails with
+ * `UDA_ERR_DETECTION_FAILED`; on Windows, acquiring the SMTC session manager
+ * fails with `UDA_ERR_NOT_SUPPORTED` or `UDA_ERR_DETECTION_FAILED`. A player
+ * session that *is* selected but whose state cannot be read is not a
+ * failure: that reports [`UDA_OK`] with `UDA_MEDIA_UNKNOWN`. On any negative
+ * status `*out_status` is left untouched.
+ *
+ * # Safety
+ *
+ * `out_status` must point to a writable, non-null `int32_t` location.
+ */
+int32_t uda_media_get_status(int32_t *out_status);
+
+/**
+ * Send a transport command to the active media player.
+ *
+ * `command` is one of [`UDA_MEDIA_CMD_PLAY`], [`UDA_MEDIA_CMD_PAUSE`],
+ * [`UDA_MEDIA_CMD_TOGGLE`], [`UDA_MEDIA_CMD_NEXT`],
+ * [`UDA_MEDIA_CMD_PREVIOUS`] or [`UDA_MEDIA_CMD_STOP`]. An unknown code returns
+ * `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
+ *
+ * `UDA_ERR_NOT_SUPPORTED` is returned
+ * when the player refuses the command and when no player is running.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_media_send_command(int32_t command);
+
+/**
+ * Report which session and power actions this platform can perform.
+ *
+ * Writes a bitmask made of the `UDA_SESSION_CAP_*` constants to
+ * `*out_capabilities`; `0` means "no receiver for any session action is
+ * reachable on this target". The query is side-effect-free - it never touches
+ * the machine's power state. On Linux the first call runs a one-shot service
+ * probe: every D-Bus await is bounded, and the session lookup starts after the
+ * presence check, so the worst case is about 35 seconds before the answer is
+ * cached; later calls are immediate. A UI therefore calls it once, ideally off
+ * the main thread, before drawing a menu - and must call it before drawing one
+ * that could shut the machine down.
+ *
+ * A set bit means a receiver for the action was reachable when the
+ * capabilities were queried; the attempt can still fail (hibernation
+ * switched off, polkit refusal) and then fails with `UDA_ERR_NOT_SUPPORTED`.
+ * On Linux `LOCK` needs the ScreenSaver service or a resolvable logind
+ * `auto` session (the caller's session, with the user's display session as
+ * the fallback logind itself applies), while `LOGOUT` and
+ * `SESSION_MANAGEMENT` need the caller's *own* logind session - resolved
+ * with `GetSession("")`, which never falls back to a display session - or a
+ * GNOME/KDE/XFCE desktop logout manager whose bus name is owned or
+ * activatable. A daemon that runs sessionless (or can only see other users'
+ * sessions, as on a systemd-enabled WSL2 host) therefore answers with the
+ * power bits, plus `LOCK` when `auto` resolves. Discovery never activates a
+ * desktop manager; activation or policy can still refuse an attempted
+ * action. Windows reboot and shutdown can likewise fail at attempt time
+ * when the caller lacks the SeShutdownPrivilege.
+ *
+ * # Safety
+ *
+ * `out_capabilities` must point at a writable `uint32_t` location.
+ */
+int32_t uda_session_capabilities(uint32_t *out_capabilities);
+
+/**
+ * Lock the session, leaving every running program alone.
+ *
+ * This is the **only** action safe to automate: it is reversible and destroys
+ * nothing. The other five exports must be gated behind an explicit user
+ * confirmation.
+ *
+ * Returns `UDA_ERR_NOT_SUPPORTED` when
+ * the platform advertises no lock capability at all.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_session_lock(void);
+
+/**
+ * End the calling user's session.
+ *
+ * **This action logs the user out.** Unsaved work is lost unless the desktop
+ * refuses to comply. Never call it without an explicit confirmation.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_session_logout(void);
+
+/**
+ * Suspend the machine to RAM.
+ *
+ * Linux: `org.freedesktop.login1.Manager.Suspend(false)`. Windows:
+ * `SetSuspendState(false, ...)`.
+ *
+ * **This action changes the machine's power state.** Never call it without an
+ * explicit user confirmation.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_session_suspend(void);
+
+/**
+ * Hibernate the machine to disk.
+ *
+ * **This action changes the machine's power state.** Unsaved work is lost.
+ * Never call it without an explicit user confirmation.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_session_hibernate(void);
+
+/**
+ * Restart the machine.
+ *
+ * On Windows this needs an elevated process or a local administrator account
+ * for `SeShutdownPrivilege`; without it the call fails with
+ * `UDA_ERR_NOT_SUPPORTED`.
+ *
+ * **This action restarts the machine.** Unsaved work is lost. Never call it
+ * without an explicit user confirmation.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_session_reboot(void);
+
+/**
+ * Power the machine off.
+ *
+ * Same elevation requirement as [`uda_session_reboot`].
+ *
+ * **This action shuts the machine down.** Unsaved work is lost. Never call it
+ * without an explicit user confirmation.
+ *
+ * # Safety
+ *
+ * This function takes no pointers; there is nothing to validate.
+ */
+int32_t uda_session_shutdown(void);
+
+/**
  * Read the current wallpaper path.
  *
- * On success `*out_path` receives a heap C string the caller must release
- * with `uda_free_string()`. When no wallpaper is configured (or the platform
- * cannot report one), `*out_path` is set to NULL while the call still
- * returns `UDA_OK` - check the pointer rather than the status to detect "no
- * wallpaper".
+ * On success `*out_path` receives a heap C string the caller must release with
+ * [`uda_free_string`]. When no wallpaper is configured (or the platform cannot
+ * report one), `*out_path` is set to null and the call still returns
+ * [`UDA_OK`] - check the pointer, not the status, to detect "no wallpaper". An
+ * empty value is never handed back as a zero-length string; it is reported as
+ * null too.
  *
  * # Safety
  *
@@ -301,12 +556,13 @@ int32_t uda_get_wallpaper(char **out_path);
 /**
  * Release a string previously returned by this library.
  *
- * Passing NULL is a no-op, so callers may free unconditionally.
- *
  * # Safety
  *
- * `s` must be null or a pointer obtained from a UDA export that hands out
- * strings. Freeing a pointer owned by the caller is undefined behaviour.
+ * `s` must be null or a pointer obtained from an export that transfers string
+ * ownership to the caller: [`uda_get_wallpaper`], [`uda_media_get_metadata`],
+ * [`uda_tray_support_reason`] or [`uda_last_error_message`]. Freeing any other
+ * pointer is undefined behaviour. Passing null is a no-op, so callers may free
+ * unconditionally.
  */
 void uda_free_string(char *s);
 
@@ -326,6 +582,11 @@ void uda_free_string(char *s);
  * failure on the same thread; read `uda_last_error_message()` only after a
  * non-`UDA_OK` status.
  *
+ * A lock acquired through the CLI fallback (no native IPC available) is
+ * bounded to roughly one hour: past that deadline the lock is retired and its
+ * handle stops being live, so a host that needs a longer lock must re-acquire
+ * it.
+ *
  * # Safety
  *
  * `out_handle` must point to a writable, non-null `uint64_t` location and
@@ -336,10 +597,9 @@ int32_t uda_wakelock_acquire(int32_t lock_type, const char *reason, uint64_t *ou
 /**
  * Release a wake lock previously obtained from `uda_wakelock_acquire()`.
  *
- * `handle` must be a value returned by `uda_wakelock_acquire()`; 0 is
- * rejected with `UDA_ERR_INVALID_ARGUMENT`, and so is any handle that is
- * not a live lock in this process (already released, or never issued
- * here).
+ * Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live lock in
+ * this process (already released, never issued here, or a fallback lock
+ * retired after its bounded lifetime elapsed).
  */
 int32_t uda_wakelock_release(uint64_t handle);
 
@@ -400,220 +660,18 @@ int32_t uda_notify(const char *app_name,
 int32_t uda_get_accent_color(uint8_t *out_rgba);
 
 /**
- * Read the now-playing metadata of the active media player.
+ * Return the message describing the most recent failure on this thread.
  *
- * On Linux the backend scans the session bus for an
- * `org.mpris.MediaPlayer2.*` service; on Windows it asks the Global System
- * Media Transport Controls session manager. Both answer "no player" when
- * none is running, which this function turns into: `*out_title`,
- * `*out_artist` and `*out_album` set to NULL, and `*out_duration_ms` /
- * `*out_position_ms` set to 0 - with a `UDA_OK` status. A now-playing card
- * therefore renders as empty rather than as a failure. If the platform has
- * no media backend at all, a negative status code is returned instead and
- * the out-parameters are left untouched.
+ * The returned string is heap-allocated by this call and its ownership moves
+ * to the caller: release it with [`uda_free_string`] and it stays valid until
+ * then, no matter how many other UDA calls run in between. Returns null when
+ * no failure has been recorded on this thread yet.
  *
- * The three strings are allocated by the library and must each be released
- * with `uda_free_string()`. Freeing NULL is a no-op, so callers may free
- * unconditionally. A field the player does not publish (a radio stream with
- * no album, say) is NULL rather than an empty string, which lets a binding
- * skip it, while a field published as an empty string stays an empty string -
- * the two cases remain distinguishable on Linux. On Windows an empty read
- * also surfaces as NULL, because SMTC has no "unset" marker on the wire, so
- * a host must treat NULL as "skip this field" everywhere rather than as a
- * Linux-only synonym for "unpublished". The artist list is already joined
- * with ", " when the player publishes several artists.
- *
- * `out_duration_ms` receives the track length in milliseconds, or 0 when
- * unknown (a live stream). `out_position_ms` is optional: pass NULL to skip
- * it; it receives the playback position in milliseconds, or 0 when the
- * backend cannot report it.
- *
- * # Safety
- *
- * `out_title`, `out_artist` and `out_album` must each point at a writable
- * `char *` location; `out_duration_ms` must point at a writable `uint64_t`;
- * `out_position_ms` must be NULL or point at a writable `uint64_t`.
+ * **Reading consumes the message.** The slot is emptied before the string is
+ * built, so an immediate second call returns null; a binding that needs the
+ * text twice must copy it or keep the returned allocation alive.
  */
-int32_t uda_media_get_metadata(char **out_title,
-                               char **out_artist,
-                               char **out_album,
-                               uint64_t *out_duration_ms,
-                               uint64_t *out_position_ms);
-
-/**
- * Read the playback status of the active media player.
- *
- * Writes `UDA_MEDIA_PLAYING`, `UDA_MEDIA_PAUSED`, `UDA_MEDIA_STOPPED` or
- * `UDA_MEDIA_UNKNOWN` to `*out_status`. `UDA_MEDIA_UNKNOWN` covers both "no
- * player is running" and "the state could not be determined", and is
- * reported with `UDA_OK`: it is an answer, not a failure. A negative status
- * code means the backend itself could not be reached: on Linux, connecting to
- * the session bus or building the player proxy fails with
- * `UDA_ERR_DETECTION_FAILED`; on Windows, acquiring the SMTC session manager
- * fails with `UDA_ERR_NOT_SUPPORTED` or `UDA_ERR_DETECTION_FAILED`. A player
- * session that *is* selected but whose state cannot be read is not a
- * failure: that reports `UDA_OK` with `UDA_MEDIA_UNKNOWN`. On any negative
- * status `*out_status` is left untouched.
- *
- * # Safety
- *
- * `out_status` must point to a writable, non-null `int32_t` location.
- */
-int32_t uda_media_get_status(int32_t *out_status);
-
-/**
- * Send a transport command to the active media player.
- *
- * `command` is one of `UDA_MEDIA_CMD_PLAY`, `UDA_MEDIA_CMD_PAUSE`,
- * `UDA_MEDIA_CMD_TOGGLE`, `UDA_MEDIA_CMD_NEXT`, `UDA_MEDIA_CMD_PREVIOUS` or
- * `UDA_MEDIA_CMD_STOP`. An unrecognised code returns
- * `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
- *
- * A machine with no player running reports `UDA_ERR_NOT_SUPPORTED`. Any
- * non-`UDA_OK` status means success was not confirmed. After a timeout or
- * communication failure, the player may already have executed the command;
- * do not blindly retry commands such as Next or Toggle, which can act twice.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_media_send_command(int32_t command);
-
-/**
- * Report which session and power actions this platform can perform.
- *
- * Writes a bitmask made of the `UDA_SESSION_CAP_*` flags to
- * `*out_capabilities`; 0 means "no session backend exists on this target".
- *
- * The query is static and side-effect-free - it never touches the machine's
- * power state - so a host may call it freely to decide which menu entries to
- * draw, and *must* call it before drawing one that could shut the machine
- * down.
- *
- * A set bit means "the code path exists", not "the account is allowed": a
- * machine with hibernation switched off still reports
- * `UDA_SESSION_CAP_HIBERNATE`, and the attempt then fails with
- * `UDA_ERR_NOT_SUPPORTED`. Likewise, Windows reboot and shutdown need the
- * SeShutdownPrivilege, which is a runtime answer.
- *
- * # Safety
- *
- * `out_capabilities` must point to a writable, non-null `uint32_t` location.
- */
-int32_t uda_session_capabilities(uint32_t *out_capabilities);
-
-/**
- * Lock the session.
- *
- * Linux: `org.freedesktop.ScreenSaver.Lock()` on the session bus, falling
- * back to `loginctl lock-session`. Windows: `LockWorkStation()`.
- *
- * This is the only session action that is safe to automate: it is reversible
- * (the user unlocks with their password) and it destroys nothing. The other
- * five `uda_session_*` actions must be gated behind an explicit user
- * confirmation.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_session_lock(void);
-
-/**
- * End the calling user's session.
- *
- * Linux: `org.freedesktop.login1.Manager.TerminateSession("")` on the system
- * bus, falling back to the desktop's own session manager (GNOME, KDE, XFCE).
- * Windows: `ExitWindowsEx(EWX_LOGOFF, 0)`.
- *
- * WARNING: this logs the user out. Unsaved work in applications that do not
- * refuse is lost. Never call it without an explicit user confirmation.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_session_logout(void);
-
-/**
- * Suspend the machine to RAM.
- *
- * Linux: `org.freedesktop.login1.Manager.Suspend(false)`. Windows:
- * `SetSuspendState(false, ...)`.
- *
- * WARNING: this changes the machine's power state. Never call it without an
- * explicit user confirmation.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_session_suspend(void);
-
-/**
- * Hibernate the machine to disk.
- *
- * Linux: `org.freedesktop.login1.Manager.Hibernate(false)`. Windows:
- * `SetSuspendState(true, ...)`, which the platform rejects with
- * ERROR_FILE_NOT_FOUND when hibernation is disabled - reported as
- * `UDA_ERR_NOT_SUPPORTED`.
- *
- * WARNING: this changes the machine's power state. Never call it without an
- * explicit user confirmation.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_session_hibernate(void);
-
-/**
- * Restart the machine.
- *
- * Linux: `org.freedesktop.login1.Manager.Reboot(false)`. Windows:
- * `ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0)` after enabling
- * SeShutdownPrivilege, which needs an elevated process or an administrator
- * account; without it the call fails with `UDA_ERR_NOT_SUPPORTED` rather
- * than half-rebooting.
- *
- * WARNING: this restarts the machine and unsaved work is lost. Never call it
- * without an explicit user confirmation.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_session_reboot(void);
-
-/**
- * Power the machine off.
- *
- * Linux: `org.freedesktop.login1.Manager.PowerOff(false)`. Windows:
- * `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, 0)` after enabling
- * SeShutdownPrivilege, with the same elevation requirement as
- * `uda_session_reboot()`.
- *
- * WARNING: this shuts the machine down and unsaved work is lost. Never call
- * it without an explicit user confirmation.
- *
- * # Safety
- *
- * This function takes no pointers; there is nothing to validate.
- */
-int32_t uda_session_shutdown(void);
-
-/**
- * Return the message describing the most recent failure on the calling
- * thread.
- *
- * Returns a newly allocated, null-terminated string that the caller must
- * release with `uda_free_string()` (cast away `const` at the call), or NULL
- * when no failure has been recorded yet. Reading consumes the message: the
- * next call returns NULL until a new failure is recorded on the same
- * thread.
- */
-const char *uda_last_error_message(void);
+char *uda_last_error_message(void);
 
 /**
  * Describe a status code with a static string.
@@ -625,52 +683,77 @@ const char *uda_last_error_message(void);
 const char *uda_status_message(int32_t status);
 
 /**
+ * Report which tray features the active platform backend advertises.
+ *
+ * Writes a bitmask made of the `UDA_TRAY_CAP_*` constants to
+ * `*out_capabilities`; `0` means "no tray backend exists on this target", and
+ * a feature the backend cannot deliver has its bit cleared. The query is
+ * side-effect-free - it never registers anything with the shell - so a host
+ * may call it freely to decide whether to build tray UI at all, and what to
+ * degrade gracefully.
+ *
+ * `UDA_TRAY_CAP_CLICK` and `UDA_TRAY_CAP_DOUBLE_CLICK` are always cleared:
+ * the C ABI has no click-callback registration, so activation is delivered
+ * only through menu rows. The constants stay defined for a future click API;
+ * a host must not infer click events from this bitmask today.
+ *
+ * # Safety
+ *
+ * `out_capabilities` must point at a writable `uint32_t` location.
+ */
+int32_t uda_tray_capabilities(uint32_t *out_capabilities);
+
+/**
+ * Report how completely this icon's tray registration succeeded.
+ *
+ * Writes one of the `UDA_TRAY_SUPPORT_LEVEL_*` codes to `*out_level`:
+ * `UDA_TRAY_SUPPORT_LEVEL_FULL` when nothing degraded,
+ * `UDA_TRAY_SUPPORT_LEVEL_PARTIAL` when the icon is live but its registration
+ * recorded a degradation - on Linux, no `StatusNotifierWatcher` is reachable
+ * or the watcher refuses the registration, so the item is exported yet the
+ * shell may never display it - and `UDA_TRAY_SUPPORT_LEVEL_NONE` only when the
+ * backend never claimed a tray at all (not reachable through handles this
+ * library issued).
+ *
+ * The answer is per icon, not per platform: `uda_tray_capabilities()` reports
+ * which code paths exist, this reports what actually happened to *this* icon,
+ * and `uda_tray_support_reason()` explains a `PARTIAL` answer.
+ *
+ * On Windows the answer is always `UDA_TRAY_SUPPORT_LEVEL_FULL` for a live
+ * icon: the Win32 worker has no watcher step, so there is no degradation path.
+ *
+ * # Safety
+ *
+ * `out_level` must point at a writable `int32_t` location.
+ */
+int32_t uda_tray_support_level(uint64_t handle, int32_t *out_level);
+
+/**
+ * Explain why a tray icon's support level is partial.
+ *
+ * On success `*out_reason` receives a heap C string the caller must release
+ * with [`uda_free_string`], or NULL when the icon is not degraded - check the
+ * pointer, not the status. A degraded icon (see `uda_tray_support_level`)
+ * always carries a non-empty reason naming what is missing or refused, e.g. a
+ * session with no `StatusNotifierWatcher` or a watcher that rejects the item;
+ * a fully supported icon reports NULL.
+ *
+ * # Safety
+ *
+ * `out_reason` must point at a writable pointer location.
+ */
+int32_t uda_tray_support_reason(uint64_t handle, char **out_reason);
+
+/**
  * Create a tray icon.
  *
- * TRAY HANDLES
- *
- * Tray icons and menus are process-local resources identified by opaque
- * `uint64_t` handles. They are NOT references, NOT pointers, and are not
- * valid in another process: each handle indexes a table owned by the shared
- * library.
- *
- * - A handle can be destroyed exactly once. Destroying it removes the table
- *   entry, so a successful destroy followed by another call with the same
- *   value is reported as `UDA_ERR_INVALID_ARGUMENT` rather than acting on a
- *   stale resource.
- * - Handle 0 is never a live resource. A zeroed out-parameter therefore
- *   unambiguously means "the call failed".
- * - A menu handle stays valid after `uda_tray_set_menu()`: the icon holds
- *   its own reference, so destroying the menu afterwards leaves the tray
- *   working. Destroy the menu explicitly only when the icon will never need
- *   it again.
- *
- * CALLBACK THREADING MODEL (read before writing a handler)
- *
- * Every menu callback is invoked on the tray worker thread that the
- * platform backend owns. It is NOT the thread that called
- * `uda_tray_menu_add_text()` and NOT your UI thread. The callback therefore
- * must:
- *
- * - return as soon as possible (a slow handler stalls every later menu
- *   interaction);
- * - not block, sleep, or wait on a lock the main thread may hold;
- * - not touch GUI toolkit state directly - post an event into the host's
- *   own loop instead;
- * - be prepared to fire after the row was removed, if the shell was already
- *   mid-dispatch.
- *
- * `user_data` is handed back to the callback verbatim. UDA never
- * dereferences it; keeping it alive is the host's responsibility. The
- * callback may be NULL, which yields a silent row that still renders and
- * still reports its state in later calls.
- *
- * ARGUMENTS
- *
- * `name` is the application name used for registration (the D-Bus bus name
- * on Linux, the window class on Windows); a NULL or empty `name` selects
- * the library default. `tooltip` may be NULL or empty; text longer than
- * 127 characters is clamped, and the call still succeeds.
+ * `name` is the application name used for registration (the D-Bus bus name on
+ * Linux, the window class on Windows); a null `name` selects the library
+ * default. `tooltip` may be null or empty. Windows applies the 127-`char`
+ * clamp at registration and then fits the result into szTip's 127 UTF-16
+ * units (a non-BMP character uses two); Linux SNI forwards the create-time
+ * text as-is. `uda_tray_set_tooltip` clamps to 127 `char`s on both platforms,
+ * and registration still succeeds either way.
  *
  * On success `*out_handle` receives a non-zero handle for every other
  * `uda_tray_*` call. On failure it is left untouched. The icon has no image
@@ -762,11 +845,11 @@ int32_t uda_tray_menu_create(uint64_t *out_menu_handle);
 /**
  * Append a plain text row to a menu.
  *
- * `callback` is invoked on the tray worker thread when the row is activated,
- * or NULL for a silent row that still renders and still reports its state
- * in later calls. `user_data` is handed back to the callback untouched and
- * is never dereferenced by UDA. `label` must be non-blank: a blank label is
- * rejected with `UDA_ERR_NOT_SUPPORTED` because it would render invisibly.
+ * `callback` is invoked on the **tray worker thread** when the row is
+ * activated. Passing `None` (null) is legal: the row still renders, but
+ * activating it does nothing. A text row has no toggle state, and there is no
+ * API to read a row's state. `user_data` is handed back to the callback
+ * untouched and is never dereferenced by UDA.
  *
  * On success `*out_item_id` receives the row's stable, non-zero id; the
  * callback receives the same value, so a host does not need a table of its
@@ -774,8 +857,10 @@ int32_t uda_tray_menu_create(uint64_t *out_menu_handle);
  *
  * # Safety
  *
- * `out_item_id` must point to a writable, non-null `uint64_t` slot and
- * `label` must be a readable, null-terminated UTF-8 string.
+ * `out_item_id` must be a valid, writable, non-null `uint64_t` slot. `label`
+ * must be a readable, null-terminated UTF-8 string; a blank label is rejected
+ * with `UDA_ERR_INVALID_ARGUMENT`
+ * because it would render an invisible row.
  */
 int32_t uda_tray_menu_add_text(uint64_t menu_handle,
                                const char *label,
@@ -794,14 +879,11 @@ int32_t uda_tray_menu_add_separator(uint64_t menu_handle);
 /**
  * Append a checkbox row to a menu.
  *
- * The row's stored value is inverted *before* `callback` runs, so the
- * `checked` argument is the new state the shell will render and the menu
- * cannot drift out of sync with it. `checked` is 0 to start unchecked, any
- * other value to start checked. `callback` is invoked on the tray worker
- * thread when the row is toggled, or NULL for a silent row. `label` must be
- * non-blank: a blank label is rejected with `UDA_ERR_NOT_SUPPORTED`.
- *
- * On success `*out_item_id` receives the row's stable, non-zero id.
+ * When a `callback` is supplied, the row's own stored value is inverted *before*
+ * it runs, so the `checked` argument is the new state the shell will render.
+ * A null callback installs no handler at all: the row renders with its initial
+ * state and never toggles, which is what a host that drives the checkbox
+ * through its own UI wants.
  *
  * # Safety
  *
@@ -819,18 +901,25 @@ int32_t uda_tray_menu_add_checkbox(uint64_t menu_handle,
  * Attach a menu to a tray icon, replacing any menu set earlier.
  *
  * The menu handle stays valid after this call: the icon holds its own
- * reference, so destroying the menu afterwards is optional and does not
- * clear the rows.
+ * reference, so the menu keeps working whether or not the handle is destroyed
+ * later. Destroying the handle (see [`uda_tray_menu_destroy`]) detaches the
+ * menu from every icon still showing it.
  */
 int32_t uda_tray_set_menu(uint64_t tray_handle, uint64_t menu_handle);
 
 /**
  * Destroy a menu handle.
  *
- * Safe to call after `uda_tray_set_menu()`, as documented there. Terminal:
- * the handle cannot be reused afterwards. Returns
- * `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live menu in this
- * process.
+ * The menu is detached from **every** tray icon that still shows it, so its
+ * rows and callbacks stop firing (a snapshot a backend already cloned stays
+ * silent instead of calling the host); the icons themselves stay alive and
+ * simply have no menu afterwards. This makes destroying a menu handle safe
+ * even when the host has already attached it. Terminal: the handle cannot be
+ * reused afterwards. Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not
+ * a live menu, and `UDA_ERR_INTERNAL` while one of the menu's callbacks is
+ * still running - the menu stays fully intact then, so a host that waits for
+ * its own callback to return and retries will succeed; the host may free its
+ * callback trampolines only after this call reports success.
  */
 int32_t uda_tray_menu_destroy(uint64_t menu_handle);
 

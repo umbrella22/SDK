@@ -1,5 +1,11 @@
 # Wallpaper Backend Specifications
 
+All backends accept a plain filesystem path as input. A `file://` URI is an
+additional input form only on GNOME and KDE, which convert it to the formats
+shown below; Hyprland, Sway, X11 and Windows require a path and receive the
+input string unchanged. The `file://` values in the GNOME and KDE sections are
+what those shells store, not a general input contract.
+
 ## GNOME (Wayland & X11)
 - Tool: GSettings / dconf over D-Bus
 - Schema: `org.gnome.desktop.background`

@@ -5,7 +5,8 @@
 入口；本文记录两端各自"怎么做到"，是唯一事实来源。
 
 > **安全前提**：六个动作里五个会结束用户会话或停止机器。本模块把
-> `capabilities()` 设计成**静态、无副作用**的查询，把六个动作设计成"返回
+> `capabilities()` 设计成**无副作用**的查询（Linux 上答案来自一次有界的
+> 服务探测，按进程缓存一次），把六个动作设计成"返回
 > `Ok` 的瞬间就已不可撤销"。只有 `Lock` 可以自动化，其余必须由宿主应用自己
 > 弹确认框。自动化测试**严禁**触发真实电源动作，见
 > §7 测试红线。
@@ -20,8 +21,8 @@
 | `SessionAction::Hibernate` | `org.freedesktop.login1.Manager.Hibernate(false)` | `powrprof!SetSuspendState(true, false, false)` |
 | `SessionAction::Reboot` | `org.freedesktop.login1.Manager.Reboot(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_REBOOT \| EWX_FORCEIFHUNG, 0)` |
 | `SessionAction::Shutdown` | `org.freedesktop.login1.Manager.PowerOff(false)` | 提权 `SeShutdownPrivilege` → `ExitWindowsEx(EWX_POWEROFF \| EWX_FORCEIFHUNG, 0)` |
-| `Capability::SESSION_MANAGEMENT` | logind 或 `loginctl` 可用 | Win32 会话/电源 API 存在 |
-| `Capability::LOCK` / `LOGOUT` / ... | 对应代码路径存在 | 对应代码路径存在 |
+| `Capability::SESSION_MANAGEMENT` | logind 调用者自身会话可解析，或桌面注销管理器已持有/可激活（判据见第 5 节） | Win32 会话/电源 API 存在 |
+| `Capability::LOCK` / `LOGOUT` / ... | 探测到对应接收方可达（逐位判据见第 5 节） | Win32 API 存在 |
 
 ### 1.1 能力位（ABI 稳定）
 
@@ -106,9 +107,10 @@ Hyprland/Sway 的 `swayidle`/`hypridle` 也导出它。Tier 3 回退是
 |---|---|---|---|---|
 | GNOME | `org.gnome.SessionManager` | `/org/gnome/SessionManager` | `org.gnome.SessionManager` | `Logout(0)` |
 | KDE | `org.kde.Shutdown` | `/Shutdown` | `org.kde.Shutdown` | `logout` |
-| XFCE | `org.xfce.Session` | `/org/xfce/Session/Manager` | `org.xfce.Session.Manager` | `Logout` |
+| XFCE | `org.xfce.SessionManager` | `/org/xfce/SessionManager` | `org.xfce.Session.Manager` | `Logout(true, false)` |
 
-每次尝试都带超时；全部失败则返回最后一次的语义错误，绝不静默成功。
+每次尝试都带超时；桌面候选只回答成功与否（拒绝仅进调试日志），全部失败时
+返回 logind 层的语义错误，绝不静默成功。
 
 ### 2.4 错误映射（D-Bus）
 
@@ -119,13 +121,16 @@ Hyprland/Sway 的 `swayidle`/`hypridle` 也导出它。Tier 3 回退是
 | `InteractiveAuthorizationRequired` | `NotSupported` | polkit 规则要弹对话框，而 UDA 宿主通常不是已注册的 polkit subject，弹不出来；同样不是"再试一次"能解决的 |
 | `org.freedesktop.systemd1.NoSuchOperation` | `NotSupported` | 机器缺这个能力（最常见：没开 swap 时休眠） |
 | `...NotSupported...` | `NotSupported` | 同上 |
-| 连接 system bus 失败 / 超时 | `DetectionFailed` | 环境问题，不是功能缺失 |
-| 其它 | `CommandFailed` | 带原文透传，便于排查 |
+| 连接 system bus 失败 / 超时 | `NotSupported` | 探测不到的接收方等同"未送达"，与环境问题同一出口 |
+| `loginctl` 非零退出 / spawn 失败 | `NotSupported` | 诊断原文保留在消息里，便于排查 |
+| 其它 | `NotSupported` | 同上 |
 
 分类是**对已渲染错误文本**做的纯函数（`map_login1_error`），因此可在无 D-Bus
 的 CI 里单测，也不依赖某个版本的 zbus 如何格式化方法错误。`AccessDenied`
-归到 `NotSupported` 而非 `CommandFailed`：调用方需要能说"请找管理员授权"，
-而不是"再试一次"。
+归到 `NotSupported` 而非通用失败：调用方需要能说"请找管理员授权"，而不是
+"再试一次"；本模块**所有**"动作未能送达"的路径（连接、polkit 拒绝、
+`NoSuchOperation`、CLI 非零退出、spawn 失败）都收敛到 `NotSupported` 一条
+出口，`include/uda.h` 承诺的 `-2` 契约因此按构造成立。
 
 ## 3. Windows：Win32 会话与电源 API
 
@@ -187,7 +192,7 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
 
 | 函数 | 出参 | 说明 |
 |---|---|---|
-| `uda_session_capabilities(out: *mut u32)` | 能力位掩码 | 无副作用，可随时调用；0 表示无后端 |
+| `uda_session_capabilities(out: *mut u32)` | 能力位掩码 | 无副作用；首次调用可能有界探测，之后使用缓存；0 表示没有任何会话动作接收方可达 |
 | `uda_session_lock()` | 无 | **唯一可自动化的动作** |
 | `uda_session_logout()` | 无 | 危险 |
 | `uda_session_suspend()` | 无 | 危险 |
@@ -210,13 +215,37 @@ shutdown 两个不可撤销动作才用它（那两个本来就要结束一切�
 
 ## 5. 能力与降级
 
-- **能力位表达"代码路径存在"，不是"账户被允许"。** 关掉休眠的机器仍上报
-  `Capability::HIBERNATE`；真正拒绝发生在运行时，成为
+- **能力位表达"查询时有接收方可达"，不是"账户被允许"。** 关掉休眠的机器
+  （logind 仍可达）仍上报 `Capability::HIBERNATE`；真正拒绝发生在运行时，成为
   `UdaError::NotSupported`。这与 Linux 的 polkit、Windows 的 1314 完全对称。
-- Linux 后端无条件上报全部七位：任何装了 systemd 的机器都有 logind，而锁屏
-  的 `loginctl` 回退连 screen saver 服务都不需要。
-- Windows 后端同样无条件上报全部七位：Win10/11 都有这四个 API；权限是运行时
-  问题（1300/1314），不是能力问题。
+- Linux 后端按运行时探测上报，结果按进程缓存一次。接收方分开判断，能力不是授权承诺：
+
+  | 能力 | 接收方判据 |
+  |---|---|
+  | SUSPEND / HIBERNATE / REBOOT / SHUTDOWN | system bus 上 logind manager 可达，不依赖会话对象 |
+  | LOCK | session bus 上 ScreenSaver 已持有服务名，或 logind `GetSession("auto")` 可解析 |
+  | LOGOUT / SESSION_MANAGEMENT | logind `GetSession("")` 可解析调用者自身会话，或桌面注销 manager 的名字已持有或可激活 |
+
+  `auto` 优先解析调用者会话，调用者没有会话时可以退到该用户的 display session，
+  与无参数 `loginctl lock-session` 的 `session/auto` 目标一致；空字符串只解析
+  caller-self，与实际 `TerminateSession("")` 一致。仅有 display session 的用户
+  服务可声明 LOCK，但不能据此声明 LOGOUT / SESSION_MANAGEMENT。注销执行仍传
+  空字符串，绝不扩大为 display session。
+
+  logind 会话探测共用一次连接、proxy 和 `ListSessions`；列表为空时两个会话
+  判据均为 false，非空后分别调用 `GetSession("auto")` 与 `GetSession("")`。
+  两次解析独立处理错误与超时，一次失败不覆盖另一次结果，也不撤下 manager
+  已证明可达的四个电源位。
+
+  caller-self 不可解析时，桌面注销探测查询 session bus 的 `ListNames` 与
+  `ListActivatableNames`，对两份结果的并集精确匹配执行体的 GNOME/KDE/XFCE
+  服务名。包括尚未启动、仅登记按需激活的 `org.kde.Shutdown`。列名字不会激活
+  服务或调用注销；可激活意味着总线有投递路径，实际激活失败或策略拒绝仍在
+  执行时处理。两个列表各自有界，单个查询失败不抹掉另一份列表已证明的接收方。
+  无任何接收方时为空集；只有 ScreenSaver 时只有 LOCK；只有桌面注销 manager
+  时只有 LOGOUT / SESSION_MANAGEMENT。
+- Windows 后端仍无条件上报全部七位：Win10/11 都有这四个 API，接收方恒可达；
+  权限是运行时问题（1300/1314），不是能力问题。
 - 非 Linux / 非 Windows 目标：`capabilities()` 返回空集，六个动作一律
   `UDA_ERR_NOT_SUPPORTED`。
 

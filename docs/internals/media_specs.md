@@ -80,8 +80,13 @@ org.freedesktop.DBus -> ListNames()
 
 `zbus` 调用失败要分开对待：`ServiceUnknown`（播放器刚好退出）与
 `UnknownProperty`（该播放器没实现那个属性）都是**可预期的竞态**，降级为
-`Ok(None)` 或该字段为空；只有连 session bus 都连不上才是
+`Ok(None)` 或该字段未发布（`None`）；只有连 session bus 都连不上才是
 `UdaError::DetectionFailed`。
+
+命令路径同理：MPRIS 方法返回错误回复是播放器**显式拒绝**（单曲队列上按
+Next 就是典型场景），映射为 `UdaError::NotSupported`（`player_refused`），
+C-ABI 上即 `UDA_ERR_NOT_SUPPORTED`（-2）；只有等待超时才映射为
+`UdaError::CommandFailed`（-5）。
 
 ## 3. Windows：WinRT SMTC
 
@@ -116,10 +121,10 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 | 成员 | 说明 |
 |---|---|
 | `TryGetMediaPropertiesAsync().get()` | `GlobalSystemMediaTransportControlsSessionMediaProperties` |
-| `.Title` / `.Artist` / `.AlbumTitle` | `HSTRING`，可能为空 |
+| `.Title` / `.Artist` / `.AlbumTitle` | `HSTRING`，可能为空；空读取折叠为 `None`（C-ABI 上是 NULL） |
 | `.Duration` | `TimeSpan`（100ns 单位），`Duration::zero()` 表示未知 |
 | `GetPlaybackInfo()?.PlaybackStatus()` | 会话级播放状态 |
-| `TryTogglePlayPauseAsync()` | 返回 `bool`：**false 表示被拒**，不是错误 |
+| `TryTogglePlayPauseAsync()` | 返回 `bool`：**false 表示被拒**（映射为 `UDA_ERR_NOT_SUPPORTED`，见 §3.4），不是错误 |
 | `TryPlayAsync()` / `TryPauseAsync()` / `TryStopAsync()` | 同上 |
 | `TrySkipNextAsync()` / `TrySkipPreviousAsync()` | 同上 |
 
@@ -134,10 +139,12 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
   "已发布但为空保持空字符串"可区分性在 Windows 上因此**不成立**，宿主必须
   两个平台统一把 NULL 当作"跳过该字段"。
 - **控制方法是 `Try*`**：返回 `false` 说明播放器拒绝（例如已暂停时再次
-  Pause）。注意：当前实现把 `false` 与 HRESULT 失败都映射为
-  `UdaError::CommandFailed`（见 `crates/uda-platform-windows/src/media.rs`），
-  C-ABI 侧表现为非 `UDA_OK` 状态码；"拒绝是否应算成功"（即规范上的
-  `Ok(())` 语义）是一个待定的设计决策，头文件对该情形不承诺具体状态码。
+  Pause）。实现把 `Ok(false)` 映射为 `UdaError::NotSupported`（见
+  `crates/uda-platform-windows/src/media.rs` 的 `command_refused`），C-ABI 上
+  即 `UDA_ERR_NOT_SUPPORTED`（-2）；只有 `Try*Async()` / `.get()` 本身失败
+  （HRESULT 错误）才映射为 `UdaError::CommandFailed`（-5）。这与 Linux 侧
+  MPRIS 错误回复的映射一致，也兑现 `include/uda.h` 对"播放器拒绝"的承诺。
+  非 `UDA_OK` 只表示"未确认成功"（见 §4.1），调用方不得据此判定命令未送达。
 - **没有 JIT 属性**：所有 SMTC 调用都是 WinRT 异步，Rust 侧统一 `.get()` 同步
   等待，避免把 async 泄漏到 C-ABI。
 
@@ -149,7 +156,7 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 |---|---|---|
 | `uda_media_get_status(out_status: *mut i32)` | `0..3` 状态码 | 无会话时写 `3`（`Unknown`）并返回 `UDA_OK` |
 | `uda_media_get_metadata(out_title, out_artist, out_album: *mut *mut c_char, out_duration_ms, out_position_ms: *mut u64)` | 三个字符串 + 时长/进度槽 | 字符串由库分配，调用方用 `uda_free_string()` 释放；无元数据或字段未发布时写 NULL；`out_duration_ms` 写 0 表示未知；仅 `out_position_ms` 允许传 `NULL` 跳过 |
-| `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；无播放器返回 `UDA_ERR_NOT_SUPPORTED` |
+| `uda_media_send_command(command: i32)` | 无 | `0..5` 命令码；无播放器可寻址或播放器拒绝（`Ok(false)`）返回 `UDA_ERR_NOT_SUPPORTED`（-2） |
 
 `uda_media_send_command` 返回非 `UDA_OK` 只表示未确认成功。超时或通信失败时，
 播放器可能已经执行命令，返回码不能证明命令未送达；调用方不得盲目重试
@@ -157,12 +164,33 @@ let session = manager.GetCurrentSession()?;   // Option<GlobalSystemMediaTranspo
 
 `out_title` / `out_artist` / `out_album` / `out_duration_ms` 四个出参指针必须非空（传 `NULL` 返回 `UDA_ERR_INVALID_ARGUMENT`）；未发布的字段以 NULL 指针（字符串）/ 0（数值）回填，而非空字符串。"已发布但为空保持空字符串"的可区分性仅 Linux 成立——Windows SMTC 线上没有"未发布"标记，空读取同样回填 NULL（§3.4），宿主在两个平台上都应把 NULL 当作"跳过该字段"。
 
+### 4.1 状态码语义
+
+- **没有播放器 / 状态不可读不是失败**：`uda_media_get_status()` 写
+  `UDA_MEDIA_UNKNOWN`（3）并返回 `UDA_OK`；`uda_media_get_metadata()` 以
+  NULL / 0 回填并返回 `UDA_OK`。二者都表示"后端回答了，只是现在没有内容"，
+  调用方不得当作错误重试。
+- **负值 = 后端不可达**：例如 Linux 连不上 session bus（
+  `UDA_ERR_DETECTION_FAILED`），或 Windows 取不到 SMTC session manager
+  （`UDA_ERR_NOT_SUPPORTED` / `UDA_ERR_DETECTION_FAILED`）。这与"没有播放器"
+  是两回事；负值时出参不被写入。
+- **命令拒绝**：已选中播放器后它显式拒绝命令（Linux 的 MPRIS 错误回复、
+  Windows 的 `Ok(false)`）返回 `UDA_ERR_NOT_SUPPORTED`（-2），不是
+  `UDA_ERR_DETECTION_FAILED`；传输层失败（D-Bus 超时、SMTC HRESULT 失败）
+  才是 `CommandFailed`（-5）。两种情况都是"未确认成功"，且都可能已经执行
+  命令，不得盲目重试。
+
 ## 5. 能力与降级
 
 `Capability::MEDIA_CONTROL` 表示"本平台存在可用的媒体播控后端"。即使置位，
 运行时仍可能无播放器——所以 `active_metadata()` 返回 `Ok(None)` 是**正常
 答案**而非失败，调用方必须按"现在没在放"处理，与 AGENTS.md Principle 1
 （Never Panic）一致。
+
+`MediaMetadata::is_empty()` 的语义是"所有字符串字段都未发布（`None`）且两个
+数值字段都未知"，全空的快照归一化为 `Ok(None)`（C 侧即 NULL / 0）。已发布
+但为空的值是 `Some("")`，**不**满足该判定，在 Linux 上以空字符串而非 NULL
+出现在 C-ABI 上（§3.4）。
 
 ## 6. 测试基线
 

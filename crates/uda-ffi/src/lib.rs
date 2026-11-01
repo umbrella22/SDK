@@ -17,8 +17,9 @@
 //! # Memory ownership
 //!
 //! - Strings **returned** by UDA are allocated by Rust and must be freed with
-//!   [`uda_free_string`]. The one exception is [`status_message`], whose
-//!   static return must **not** be freed.
+//!   [`uda_free_string`], including [`uda_last_error_message`]. The only
+//!   exception is [`uda_status_message`] (a static string), which must never be
+//!   freed.
 //! - Strings **passed in** are borrowed for the duration of the call only.
 //! - Wake-lock handles are `uint64_t` values owned by this process; release each
 //!   exactly once with [`uda_wakelock_release`].
@@ -88,11 +89,11 @@ pub unsafe extern "C" fn uda_detect_theme(out_theme: *mut i32) -> i32 {
 
 /// Set the desktop wallpaper.
 ///
-/// `path` is a null-terminated UTF-8 filesystem path; on Linux a `file://`
-/// URI is also accepted, while Windows requires a plain filesystem path. An
-/// empty path is rejected as an invalid argument rather than being sent to
-/// the backend. `fill_mode` is one of the `UDA_FILL_*` codes; anything else
-/// is rejected.
+/// `path` accepts a plain filesystem path on every backend. A `file://` URI is
+/// additionally accepted on GNOME and KDE, which convert it before handing the
+/// value to their shell; other backends (Windows, Hyprland, Sway, X11) require
+/// a path and receive the string unchanged. An empty path is rejected as an
+/// invalid argument rather than being sent to the backend.
 ///
 /// On failure a negative status code is returned and no wallpaper is changed.
 ///
@@ -120,13 +121,271 @@ pub unsafe extern "C" fn uda_set_wallpaper(path: *const c_char, fill_mode: i32) 
     })
 }
 
+/// Read the metadata of the active media player.
+///
+/// The three strings are allocated by Rust and must be released with
+/// [`uda_free_string`]. An unpublished field is written as a null pointer, or
+/// zero for a duration, so each pointer must be checked before it is read. A
+/// field published as an empty string stays an empty C string where the backend
+/// can tell the two apart (Linux); on Windows an empty read also surfaces as
+/// null, because SMTC has no "unset" marker on the wire, so a host must treat
+/// null as "skip this field" everywhere. With no player running every
+/// out-parameter is set to null/zero and [`UDA_OK`] is still returned.
+///
+/// `out_position_ms` is optional: pass null to skip it.
+///
+/// # Safety
+///
+/// `out_title`, `out_artist` and `out_album` must each point at a writable
+/// `char *` location; `out_duration_ms` must point at a writable `uint64_t`;
+/// `out_position_ms` must be null or point at a writable `uint64_t`.
+#[no_mangle]
+pub unsafe extern "C" fn uda_media_get_metadata(
+    out_title: *mut *mut c_char,
+    out_artist: *mut *mut c_char,
+    out_album: *mut *mut c_char,
+    out_duration_ms: *mut u64,
+    out_position_ms: *mut u64,
+) -> i32 {
+    if out_title.is_null()
+        || out_artist.is_null()
+        || out_album.is_null()
+        || out_duration_ms.is_null()
+    {
+        util::set_last_message(
+            "`out_title`, `out_artist`, `out_album` and `out_duration_ms` must not be null",
+        );
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let metadata = media::active_metadata()?.unwrap_or_default();
+
+        // The documented empty answer: an unpublished field is NULL rather
+        // than an empty C string, "no player" (which the backends already
+        // normalize into `None`) is NULL everywhere, and a zero duration
+        // means "unknown" - all with a UDA_OK status, so a now-playing card
+        // renders as empty instead of as a failure.
+        let title = c_string_or_null(metadata.title.as_deref());
+        let artist = c_string_or_null(metadata.artist.as_deref());
+        let album = c_string_or_null(metadata.album.as_deref());
+        let duration_ms = metadata.duration_ms.unwrap_or(0);
+        let position_ms = metadata.position_ms.unwrap_or(0);
+
+        // SAFETY: all four pointers were validated non-null and writable above;
+        // `out_position_ms` is checked before the optional write.
+        unsafe {
+            *out_title = title;
+            *out_artist = artist;
+            *out_album = album;
+            *out_duration_ms = duration_ms;
+            if !out_position_ms.is_null() {
+                *out_position_ms = position_ms;
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Read the playback status of the active media player.
+///
+/// Writes `UDA_MEDIA_PLAYING`, `UDA_MEDIA_PAUSED`, `UDA_MEDIA_STOPPED` or
+/// `UDA_MEDIA_UNKNOWN` to `*out_status`. `UDA_MEDIA_UNKNOWN` covers both "no
+/// player is running" and "the state could not be determined", and is
+/// reported with [`UDA_OK`]: it is an answer, not a failure. A negative status
+/// code means the backend itself could not be reached: on Linux, connecting to
+/// the session bus or building the player proxy fails with
+/// `UDA_ERR_DETECTION_FAILED`; on Windows, acquiring the SMTC session manager
+/// fails with `UDA_ERR_NOT_SUPPORTED` or `UDA_ERR_DETECTION_FAILED`. A player
+/// session that *is* selected but whose state cannot be read is not a
+/// failure: that reports [`UDA_OK`] with `UDA_MEDIA_UNKNOWN`. On any negative
+/// status `*out_status` is left untouched.
+///
+/// # Safety
+///
+/// `out_status` must point to a writable, non-null `int32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_media_get_status(out_status: *mut i32) -> i32 {
+    if out_status.is_null() {
+        util::set_last_message("`out_status` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let status = media::playback_status()?;
+
+        // SAFETY: the pointer was validated non-null and writable.
+        unsafe { *out_status = status.code() };
+        Ok(())
+    })
+}
+
+/// Send a transport command to the active media player.
+///
+/// `command` is one of [`UDA_MEDIA_CMD_PLAY`], [`UDA_MEDIA_CMD_PAUSE`],
+/// [`UDA_MEDIA_CMD_TOGGLE`], [`UDA_MEDIA_CMD_NEXT`],
+/// [`UDA_MEDIA_CMD_PREVIOUS`] or [`UDA_MEDIA_CMD_STOP`]. An unknown code returns
+/// `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
+///
+/// `UDA_ERR_NOT_SUPPORTED` is returned
+/// when the player refuses the command and when no player is running.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_media_send_command(command: i32) -> i32 {
+    util::catch_boundary(|| {
+        let command = media::command_from_c(command)?;
+        media::send_command(command)
+    })
+}
+
+/// Report which session and power actions this platform can perform.
+///
+/// Writes a bitmask made of the `UDA_SESSION_CAP_*` constants to
+/// `*out_capabilities`; `0` means "no receiver for any session action is
+/// reachable on this target". The query is side-effect-free - it never touches
+/// the machine's power state. On Linux the first call runs a one-shot service
+/// probe: every D-Bus await is bounded, and the session lookup starts after the
+/// presence check, so the worst case is about 35 seconds before the answer is
+/// cached; later calls are immediate. A UI therefore calls it once, ideally off
+/// the main thread, before drawing a menu - and must call it before drawing one
+/// that could shut the machine down.
+///
+/// A set bit means a receiver for the action was reachable when the
+/// capabilities were queried; the attempt can still fail (hibernation
+/// switched off, polkit refusal) and then fails with `UDA_ERR_NOT_SUPPORTED`.
+/// On Linux `LOCK` needs the ScreenSaver service or a resolvable logind
+/// `auto` session (the caller's session, with the user's display session as
+/// the fallback logind itself applies), while `LOGOUT` and
+/// `SESSION_MANAGEMENT` need the caller's *own* logind session - resolved
+/// with `GetSession("")`, which never falls back to a display session - or a
+/// GNOME/KDE/XFCE desktop logout manager whose bus name is owned or
+/// activatable. A daemon that runs sessionless (or can only see other users'
+/// sessions, as on a systemd-enabled WSL2 host) therefore answers with the
+/// power bits, plus `LOCK` when `auto` resolves. Discovery never activates a
+/// desktop manager; activation or policy can still refuse an attempted
+/// action. Windows reboot and shutdown can likewise fail at attempt time
+/// when the caller lacks the SeShutdownPrivilege.
+///
+/// # Safety
+///
+/// `out_capabilities` must point at a writable `uint32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) -> i32 {
+    if out_capabilities.is_null() {
+        util::set_last_message("`out_capabilities` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // `uint32_t` at this address.
+        unsafe { *out_capabilities = session::capabilities().bits() };
+        Ok(())
+    })
+}
+
+/// Lock the session, leaving every running program alone.
+///
+/// This is the **only** action safe to automate: it is reversible and destroys
+/// nothing. The other five exports must be gated behind an explicit user
+/// confirmation.
+///
+/// Returns `UDA_ERR_NOT_SUPPORTED` when
+/// the platform advertises no lock capability at all.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_lock() -> i32 {
+    util::catch_boundary(|| session::perform(SessionAction::Lock))
+}
+
+/// End the calling user's session.
+///
+/// **This action logs the user out.** Unsaved work is lost unless the desktop
+/// refuses to comply. Never call it without an explicit confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_logout() -> i32 {
+    util::catch_boundary(|| session::perform(SessionAction::Logout))
+}
+
+/// Suspend the machine to RAM.
+///
+/// Linux: `org.freedesktop.login1.Manager.Suspend(false)`. Windows:
+/// `SetSuspendState(false, ...)`.
+///
+/// **This action changes the machine's power state.** Never call it without an
+/// explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_suspend() -> i32 {
+    util::catch_boundary(|| session::perform(SessionAction::Suspend))
+}
+
+/// Hibernate the machine to disk.
+///
+/// **This action changes the machine's power state.** Unsaved work is lost.
+/// Never call it without an explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_hibernate() -> i32 {
+    util::catch_boundary(|| session::perform(SessionAction::Hibernate))
+}
+
+/// Restart the machine.
+///
+/// On Windows this needs an elevated process or a local administrator account
+/// for `SeShutdownPrivilege`; without it the call fails with
+/// `UDA_ERR_NOT_SUPPORTED`.
+///
+/// **This action restarts the machine.** Unsaved work is lost. Never call it
+/// without an explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_reboot() -> i32 {
+    util::catch_boundary(|| session::perform(SessionAction::Reboot))
+}
+
+/// Power the machine off.
+///
+/// Same elevation requirement as [`uda_session_reboot`].
+///
+/// **This action shuts the machine down.** Unsaved work is lost. Never call it
+/// without an explicit user confirmation.
+///
+/// # Safety
+///
+/// This function takes no pointers; there is nothing to validate.
+#[no_mangle]
+pub unsafe extern "C" fn uda_session_shutdown() -> i32 {
+    util::catch_boundary(|| session::perform(SessionAction::Shutdown))
+}
+
 /// Read the current wallpaper path.
 ///
-/// On success `*out_path` receives a heap C string the caller must release
-/// with `uda_free_string()`. When no wallpaper is configured (or the platform
-/// cannot report one), `*out_path` is set to NULL while the call still
-/// returns `UDA_OK` - check the pointer rather than the status to detect "no
-/// wallpaper".
+/// On success `*out_path` receives a heap C string the caller must release with
+/// [`uda_free_string`]. When no wallpaper is configured (or the platform cannot
+/// report one), `*out_path` is set to null and the call still returns
+/// [`UDA_OK`] - check the pointer, not the status, to detect "no wallpaper". An
+/// empty value is never handed back as a zero-length string; it is reported as
+/// null too.
 ///
 /// # Safety
 ///
@@ -155,12 +414,13 @@ pub unsafe extern "C" fn uda_get_wallpaper(out_path: *mut *mut c_char) -> i32 {
 
 /// Release a string previously returned by this library.
 ///
-/// Passing NULL is a no-op, so callers may free unconditionally.
-///
 /// # Safety
 ///
-/// `s` must be null or a pointer obtained from a UDA export that hands out
-/// strings. Freeing a pointer owned by the caller is undefined behaviour.
+/// `s` must be null or a pointer obtained from an export that transfers string
+/// ownership to the caller: [`uda_get_wallpaper`], [`uda_media_get_metadata`],
+/// [`uda_tray_support_reason`] or [`uda_last_error_message`]. Freeing any other
+/// pointer is undefined behaviour. Passing null is a no-op, so callers may free
+/// unconditionally.
 #[no_mangle]
 pub unsafe extern "C" fn uda_free_string(s: *mut c_char) {
     let _ = util::catch_boundary(|| {
@@ -184,6 +444,11 @@ pub unsafe extern "C" fn uda_free_string(s: *mut c_char) {
 /// of its own, but it does not clear an unread message left by an earlier
 /// failure on the same thread; read `uda_last_error_message()` only after a
 /// non-`UDA_OK` status.
+///
+/// A lock acquired through the CLI fallback (no native IPC available) is
+/// bounded to roughly one hour: past that deadline the lock is retired and its
+/// handle stops being live, so a host that needs a longer lock must re-acquire
+/// it.
 ///
 /// # Safety
 ///
@@ -217,10 +482,9 @@ pub unsafe extern "C" fn uda_wakelock_acquire(
 
 /// Release a wake lock previously obtained from `uda_wakelock_acquire()`.
 ///
-/// `handle` must be a value returned by `uda_wakelock_acquire()`; 0 is
-/// rejected with `UDA_ERR_INVALID_ARGUMENT`, and so is any handle that is
-/// not a live lock in this process (already released, or never issued
-/// here).
+/// Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live lock in
+/// this process (already released, never issued here, or a fallback lock
+/// retired after its bounded lifetime elapsed).
 #[no_mangle]
 pub extern "C" fn uda_wakelock_release(handle: u64) -> i32 {
     util::catch_boundary(|| {
@@ -327,304 +591,19 @@ pub unsafe extern "C" fn uda_get_accent_color(out_rgba: *mut u8) -> i32 {
     })
 }
 
-/// Read the now-playing metadata of the active media player.
+/// Return the message describing the most recent failure on this thread.
 ///
-/// On Linux the backend scans the session bus for an
-/// `org.mpris.MediaPlayer2.*` service; on Windows it asks the Global System
-/// Media Transport Controls session manager. Both answer "no player" when
-/// none is running, which this function turns into: `*out_title`,
-/// `*out_artist` and `*out_album` set to NULL, and `*out_duration_ms` /
-/// `*out_position_ms` set to 0 - with a `UDA_OK` status. A now-playing card
-/// therefore renders as empty rather than as a failure. If the platform has
-/// no media backend at all, a negative status code is returned instead and
-/// the out-parameters are left untouched.
+/// The returned string is heap-allocated by this call and its ownership moves
+/// to the caller: release it with [`uda_free_string`] and it stays valid until
+/// then, no matter how many other UDA calls run in between. Returns null when
+/// no failure has been recorded on this thread yet.
 ///
-/// The three strings are allocated by the library and must each be released
-/// with `uda_free_string()`. Freeing NULL is a no-op, so callers may free
-/// unconditionally. A field the player does not publish (a radio stream with
-/// no album, say) is NULL rather than an empty string, which lets a binding
-/// skip it, while a field published as an empty string stays an empty string -
-/// the two cases remain distinguishable on Linux. On Windows an empty read
-/// also surfaces as NULL, because SMTC has no "unset" marker on the wire, so
-/// a host must treat NULL as "skip this field" everywhere rather than as a
-/// Linux-only synonym for "unpublished". The artist list is already joined
-/// with ", " when the player publishes several artists.
-///
-/// `out_duration_ms` receives the track length in milliseconds, or 0 when
-/// unknown (a live stream). `out_position_ms` is optional: pass NULL to skip
-/// it; it receives the playback position in milliseconds, or 0 when the
-/// backend cannot report it.
-///
-/// # Safety
-///
-/// `out_title`, `out_artist` and `out_album` must each point at a writable
-/// `char *` location; `out_duration_ms` must point at a writable `uint64_t`;
-/// `out_position_ms` must be NULL or point at a writable `uint64_t`.
+/// **Reading consumes the message.** The slot is emptied before the string is
+/// built, so an immediate second call returns null; a binding that needs the
+/// text twice must copy it or keep the returned allocation alive.
 #[no_mangle]
-pub unsafe extern "C" fn uda_media_get_metadata(
-    out_title: *mut *mut c_char,
-    out_artist: *mut *mut c_char,
-    out_album: *mut *mut c_char,
-    out_duration_ms: *mut u64,
-    out_position_ms: *mut u64,
-) -> i32 {
-    if out_title.is_null()
-        || out_artist.is_null()
-        || out_album.is_null()
-        || out_duration_ms.is_null()
-    {
-        util::set_last_message(
-            "`out_title`, `out_artist`, `out_album` and `out_duration_ms` must not be null",
-        );
-        return UDA_ERR_INVALID_ARGUMENT;
-    }
-
-    util::catch_boundary(|| {
-        let metadata = media::active_metadata()?.unwrap_or_default();
-
-        // The documented empty answer: an unpublished field is NULL rather
-        // than an empty C string, "no player" (which the backends already
-        // normalize into `None`) is NULL everywhere, and a zero duration
-        // means "unknown" - all with a UDA_OK status, so a now-playing card
-        // renders as empty instead of as a failure.
-        let title = c_string_or_null(metadata.title.as_deref());
-        let artist = c_string_or_null(metadata.artist.as_deref());
-        let album = c_string_or_null(metadata.album.as_deref());
-        let duration_ms = metadata.duration_ms.unwrap_or(0);
-        let position_ms = metadata.position_ms.unwrap_or(0);
-
-        // SAFETY: all four pointers were validated non-null and writable above;
-        // `out_position_ms` is checked before the optional write.
-        unsafe {
-            *out_title = title;
-            *out_artist = artist;
-            *out_album = album;
-            *out_duration_ms = duration_ms;
-            if !out_position_ms.is_null() {
-                *out_position_ms = position_ms;
-            }
-        }
-        Ok(())
-    })
-}
-
-/// Read the playback status of the active media player.
-///
-/// Writes `UDA_MEDIA_PLAYING`, `UDA_MEDIA_PAUSED`, `UDA_MEDIA_STOPPED` or
-/// `UDA_MEDIA_UNKNOWN` to `*out_status`. `UDA_MEDIA_UNKNOWN` covers both "no
-/// player is running" and "the state could not be determined", and is
-/// reported with `UDA_OK`: it is an answer, not a failure. A negative status
-/// code means the backend itself could not be reached: on Linux, connecting to
-/// the session bus or building the player proxy fails with
-/// `UDA_ERR_DETECTION_FAILED`; on Windows, acquiring the SMTC session manager
-/// fails with `UDA_ERR_NOT_SUPPORTED` or `UDA_ERR_DETECTION_FAILED`. A player
-/// session that *is* selected but whose state cannot be read is not a
-/// failure: that reports `UDA_OK` with `UDA_MEDIA_UNKNOWN`. On any negative
-/// status `*out_status` is left untouched.
-///
-/// # Safety
-///
-/// `out_status` must point to a writable, non-null `int32_t` location.
-#[no_mangle]
-pub unsafe extern "C" fn uda_media_get_status(out_status: *mut i32) -> i32 {
-    if out_status.is_null() {
-        util::set_last_message("`out_status` must not be null");
-        return UDA_ERR_INVALID_ARGUMENT;
-    }
-
-    util::catch_boundary(|| {
-        let status = media::playback_status()?;
-
-        // SAFETY: the pointer was validated non-null and writable.
-        unsafe { *out_status = status.code() };
-        Ok(())
-    })
-}
-
-/// Send a transport command to the active media player.
-///
-/// `command` is one of `UDA_MEDIA_CMD_PLAY`, `UDA_MEDIA_CMD_PAUSE`,
-/// `UDA_MEDIA_CMD_TOGGLE`, `UDA_MEDIA_CMD_NEXT`, `UDA_MEDIA_CMD_PREVIOUS` or
-/// `UDA_MEDIA_CMD_STOP`. An unrecognised code returns
-/// `UDA_ERR_INVALID_ARGUMENT` and nothing is sent.
-///
-/// A machine with no player running reports `UDA_ERR_NOT_SUPPORTED`. Any
-/// non-`UDA_OK` status means success was not confirmed. After a timeout or
-/// communication failure, the player may already have executed the command;
-/// do not blindly retry commands such as Next or Toggle, which can act twice.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_media_send_command(command: i32) -> i32 {
-    util::catch_boundary(|| {
-        let command = media::command_from_c(command)?;
-        media::send_command(command)
-    })
-}
-
-/// Report which session and power actions this platform can perform.
-///
-/// Writes a bitmask made of the `UDA_SESSION_CAP_*` flags to
-/// `*out_capabilities`; 0 means "no session backend exists on this target".
-///
-/// The query is static and side-effect-free - it never touches the machine's
-/// power state - so a host may call it freely to decide which menu entries to
-/// draw, and *must* call it before drawing one that could shut the machine
-/// down.
-///
-/// A set bit means "the code path exists", not "the account is allowed": a
-/// machine with hibernation switched off still reports
-/// `UDA_SESSION_CAP_HIBERNATE`, and the attempt then fails with
-/// `UDA_ERR_NOT_SUPPORTED`. Likewise, Windows reboot and shutdown need the
-/// SeShutdownPrivilege, which is a runtime answer.
-///
-/// # Safety
-///
-/// `out_capabilities` must point to a writable, non-null `uint32_t` location.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_capabilities(out_capabilities: *mut u32) -> i32 {
-    if out_capabilities.is_null() {
-        util::set_last_message("`out_capabilities` must not be null");
-        return UDA_ERR_INVALID_ARGUMENT;
-    }
-
-    util::catch_boundary(|| {
-        // SAFETY: null was rejected above, and the caller guarantees a writable
-        // `uint32_t` at this address.
-        unsafe { *out_capabilities = session::capabilities().bits() };
-        Ok(())
-    })
-}
-
-/// Lock the session.
-///
-/// Linux: `org.freedesktop.ScreenSaver.Lock()` on the session bus, falling
-/// back to `loginctl lock-session`. Windows: `LockWorkStation()`.
-///
-/// This is the only session action that is safe to automate: it is reversible
-/// (the user unlocks with their password) and it destroys nothing. The other
-/// five `uda_session_*` actions must be gated behind an explicit user
-/// confirmation.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_lock() -> i32 {
-    util::catch_boundary(|| session::perform(SessionAction::Lock))
-}
-
-/// End the calling user's session.
-///
-/// Linux: `org.freedesktop.login1.Manager.TerminateSession("")` on the system
-/// bus, falling back to the desktop's own session manager (GNOME, KDE, XFCE).
-/// Windows: `ExitWindowsEx(EWX_LOGOFF, 0)`.
-///
-/// WARNING: this logs the user out. Unsaved work in applications that do not
-/// refuse is lost. Never call it without an explicit user confirmation.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_logout() -> i32 {
-    util::catch_boundary(|| session::perform(SessionAction::Logout))
-}
-
-/// Suspend the machine to RAM.
-///
-/// Linux: `org.freedesktop.login1.Manager.Suspend(false)`. Windows:
-/// `SetSuspendState(false, ...)`.
-///
-/// WARNING: this changes the machine's power state. Never call it without an
-/// explicit user confirmation.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_suspend() -> i32 {
-    util::catch_boundary(|| session::perform(SessionAction::Suspend))
-}
-
-/// Hibernate the machine to disk.
-///
-/// Linux: `org.freedesktop.login1.Manager.Hibernate(false)`. Windows:
-/// `SetSuspendState(true, ...)`, which the platform rejects with
-/// ERROR_FILE_NOT_FOUND when hibernation is disabled - reported as
-/// `UDA_ERR_NOT_SUPPORTED`.
-///
-/// WARNING: this changes the machine's power state. Never call it without an
-/// explicit user confirmation.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_hibernate() -> i32 {
-    util::catch_boundary(|| session::perform(SessionAction::Hibernate))
-}
-
-/// Restart the machine.
-///
-/// Linux: `org.freedesktop.login1.Manager.Reboot(false)`. Windows:
-/// `ExitWindowsEx(EWX_REBOOT | EWX_FORCEIFHUNG, 0)` after enabling
-/// SeShutdownPrivilege, which needs an elevated process or an administrator
-/// account; without it the call fails with `UDA_ERR_NOT_SUPPORTED` rather
-/// than half-rebooting.
-///
-/// WARNING: this restarts the machine and unsaved work is lost. Never call it
-/// without an explicit user confirmation.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_reboot() -> i32 {
-    util::catch_boundary(|| session::perform(SessionAction::Reboot))
-}
-
-/// Power the machine off.
-///
-/// Linux: `org.freedesktop.login1.Manager.PowerOff(false)`. Windows:
-/// `ExitWindowsEx(EWX_POWEROFF | EWX_FORCEIFHUNG, 0)` after enabling
-/// SeShutdownPrivilege, with the same elevation requirement as
-/// `uda_session_reboot()`.
-///
-/// WARNING: this shuts the machine down and unsaved work is lost. Never call
-/// it without an explicit user confirmation.
-///
-/// # Safety
-///
-/// This function takes no pointers; there is nothing to validate.
-#[no_mangle]
-pub unsafe extern "C" fn uda_session_shutdown() -> i32 {
-    util::catch_boundary(|| session::perform(SessionAction::Shutdown))
-}
-
-/// Return the message describing the most recent failure on the calling
-/// thread.
-///
-/// Returns a newly allocated, null-terminated string that the caller must
-/// release with `uda_free_string()` (cast away `const` at the call), or NULL
-/// when no failure has been recorded yet. Reading consumes the message: the
-/// next call returns NULL until a new failure is recorded on the same
-/// thread.
-#[no_mangle]
-pub extern "C" fn uda_last_error_message() -> *const c_char {
-    let Some(message) = util::take_last_message() else {
-        return std::ptr::null();
-    };
-
-    // Leaked on purpose: the caller frees it with `uda_free_string`, keeping one
-    // allocation policy for every string the library hands out. `UdaError`'s
-    // `Display` never emits an interior nul, so the failure arm is unreachable.
-    match std::ffi::CString::new(message) {
-        Ok(c_string) => c_string.into_raw().cast_const(),
-        Err(_) => std::ptr::null(),
-    }
+pub extern "C" fn uda_last_error_message() -> *mut c_char {
+    util::last_error_pointer()
 }
 
 /// Describe a status code with a static string.
@@ -657,52 +636,122 @@ pub extern "C" fn uda_status_message(status: i32) -> *const c_char {
 // destroy of the same value is `UDA_ERR_INVALID_ARGUMENT` rather than a silent
 // no-op, so a host cannot double-release a shell resource.
 
+/// Report which tray features the active platform backend advertises.
+///
+/// Writes a bitmask made of the `UDA_TRAY_CAP_*` constants to
+/// `*out_capabilities`; `0` means "no tray backend exists on this target", and
+/// a feature the backend cannot deliver has its bit cleared. The query is
+/// side-effect-free - it never registers anything with the shell - so a host
+/// may call it freely to decide whether to build tray UI at all, and what to
+/// degrade gracefully.
+///
+/// `UDA_TRAY_CAP_CLICK` and `UDA_TRAY_CAP_DOUBLE_CLICK` are always cleared:
+/// the C ABI has no click-callback registration, so activation is delivered
+/// only through menu rows. The constants stay defined for a future click API;
+/// a host must not infer click events from this bitmask today.
+///
+/// # Safety
+///
+/// `out_capabilities` must point at a writable `uint32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_capabilities(out_capabilities: *mut u32) -> i32 {
+    if out_capabilities.is_null() {
+        util::set_last_message("`out_capabilities` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        // The C ABI cannot deliver click callbacks, so the backend's click bits
+        // are masked off rather than advertised. See the doc comment above.
+        // The bit values live in `crate::abi` with the rest of the C ABI.
+        const UNDELIVERABLE_BY_C_ABI: u32 = UDA_TRAY_CAP_CLICK | UDA_TRAY_CAP_DOUBLE_CLICK;
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // `uint32_t` at this address.
+        unsafe { *out_capabilities = tray::capabilities().bits() & !UNDELIVERABLE_BY_C_ABI };
+        Ok(())
+    })
+}
+
+/// Report how completely this icon's tray registration succeeded.
+///
+/// Writes one of the `UDA_TRAY_SUPPORT_LEVEL_*` codes to `*out_level`:
+/// `UDA_TRAY_SUPPORT_LEVEL_FULL` when nothing degraded,
+/// `UDA_TRAY_SUPPORT_LEVEL_PARTIAL` when the icon is live but its registration
+/// recorded a degradation - on Linux, no `StatusNotifierWatcher` is reachable
+/// or the watcher refuses the registration, so the item is exported yet the
+/// shell may never display it - and `UDA_TRAY_SUPPORT_LEVEL_NONE` only when the
+/// backend never claimed a tray at all (not reachable through handles this
+/// library issued).
+///
+/// The answer is per icon, not per platform: `uda_tray_capabilities()` reports
+/// which code paths exist, this reports what actually happened to *this* icon,
+/// and `uda_tray_support_reason()` explains a `PARTIAL` answer.
+///
+/// On Windows the answer is always `UDA_TRAY_SUPPORT_LEVEL_FULL` for a live
+/// icon: the Win32 worker has no watcher step, so there is no degradation path.
+///
+/// # Safety
+///
+/// `out_level` must point at a writable `int32_t` location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_support_level(handle: u64, out_level: *mut i32) -> i32 {
+    if out_level.is_null() {
+        util::set_last_message("`out_level` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let level = tray::support_level(handle)?;
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // `int32_t` at this address.
+        unsafe { *out_level = level };
+        Ok(())
+    })
+}
+
+/// Explain why a tray icon's support level is partial.
+///
+/// On success `*out_reason` receives a heap C string the caller must release
+/// with [`uda_free_string`], or NULL when the icon is not degraded - check the
+/// pointer, not the status. A degraded icon (see `uda_tray_support_level`)
+/// always carries a non-empty reason naming what is missing or refused, e.g. a
+/// session with no `StatusNotifierWatcher` or a watcher that rejects the item;
+/// a fully supported icon reports NULL.
+///
+/// # Safety
+///
+/// `out_reason` must point at a writable pointer location.
+#[no_mangle]
+pub unsafe extern "C" fn uda_tray_support_reason(handle: u64, out_reason: *mut *mut c_char) -> i32 {
+    if out_reason.is_null() {
+        util::set_last_message("`out_reason` must not be null");
+        return UDA_ERR_INVALID_ARGUMENT;
+    }
+
+    util::catch_boundary(|| {
+        let reason = tray::support_reason(handle)?;
+
+        // SAFETY: null was rejected above, and the caller guarantees a writable
+        // pointer slot at this address.
+        unsafe {
+            *out_reason = match &reason {
+                Some(text) => util::c_string_from(text),
+                None => std::ptr::null_mut(),
+            };
+        }
+        Ok(())
+    })
+}
+
 /// Create a tray icon.
 ///
-/// TRAY HANDLES
-///
-/// Tray icons and menus are process-local resources identified by opaque
-/// `uint64_t` handles. They are NOT references, NOT pointers, and are not
-/// valid in another process: each handle indexes a table owned by the shared
-/// library.
-///
-/// - A handle can be destroyed exactly once. Destroying it removes the table
-///   entry, so a successful destroy followed by another call with the same
-///   value is reported as `UDA_ERR_INVALID_ARGUMENT` rather than acting on a
-///   stale resource.
-/// - Handle 0 is never a live resource. A zeroed out-parameter therefore
-///   unambiguously means "the call failed".
-/// - A menu handle stays valid after `uda_tray_set_menu()`: the icon holds
-///   its own reference, so destroying the menu afterwards leaves the tray
-///   working. Destroy the menu explicitly only when the icon will never need
-///   it again.
-///
-/// CALLBACK THREADING MODEL (read before writing a handler)
-///
-/// Every menu callback is invoked on the tray worker thread that the
-/// platform backend owns. It is NOT the thread that called
-/// `uda_tray_menu_add_text()` and NOT your UI thread. The callback therefore
-/// must:
-///
-/// - return as soon as possible (a slow handler stalls every later menu
-///   interaction);
-/// - not block, sleep, or wait on a lock the main thread may hold;
-/// - not touch GUI toolkit state directly - post an event into the host's
-///   own loop instead;
-/// - be prepared to fire after the row was removed, if the shell was already
-///   mid-dispatch.
-///
-/// `user_data` is handed back to the callback verbatim. UDA never
-/// dereferences it; keeping it alive is the host's responsibility. The
-/// callback may be NULL, which yields a silent row that still renders and
-/// still reports its state in later calls.
-///
-/// ARGUMENTS
-///
-/// `name` is the application name used for registration (the D-Bus bus name
-/// on Linux, the window class on Windows); a NULL or empty `name` selects
-/// the library default. `tooltip` may be NULL or empty; text longer than
-/// 127 characters is clamped, and the call still succeeds.
+/// `name` is the application name used for registration (the D-Bus bus name on
+/// Linux, the window class on Windows); a null `name` selects the library
+/// default. `tooltip` may be null or empty. Windows applies the 127-`char`
+/// clamp at registration and then fits the result into szTip's 127 UTF-16
+/// units (a non-BMP character uses two); Linux SNI forwards the create-time
+/// text as-is. `uda_tray_set_tooltip` clamps to 127 `char`s on both platforms,
+/// and registration still succeeds either way.
 ///
 /// On success `*out_handle` receives a non-zero handle for every other
 /// `uda_tray_*` call. On failure it is left untouched. The icon has no image
@@ -856,11 +905,11 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> i32 
 
 /// Append a plain text row to a menu.
 ///
-/// `callback` is invoked on the tray worker thread when the row is activated,
-/// or NULL for a silent row that still renders and still reports its state
-/// in later calls. `user_data` is handed back to the callback untouched and
-/// is never dereferenced by UDA. `label` must be non-blank: a blank label is
-/// rejected with `UDA_ERR_NOT_SUPPORTED` because it would render invisibly.
+/// `callback` is invoked on the **tray worker thread** when the row is
+/// activated. Passing `None` (null) is legal: the row still renders, but
+/// activating it does nothing. A text row has no toggle state, and there is no
+/// API to read a row's state. `user_data` is handed back to the callback
+/// untouched and is never dereferenced by UDA.
 ///
 /// On success `*out_item_id` receives the row's stable, non-zero id; the
 /// callback receives the same value, so a host does not need a table of its
@@ -868,8 +917,10 @@ pub unsafe extern "C" fn uda_tray_menu_create(out_menu_handle: *mut u64) -> i32 
 ///
 /// # Safety
 ///
-/// `out_item_id` must point to a writable, non-null `uint64_t` slot and
-/// `label` must be a readable, null-terminated UTF-8 string.
+/// `out_item_id` must be a valid, writable, non-null `uint64_t` slot. `label`
+/// must be a readable, null-terminated UTF-8 string; a blank label is rejected
+/// with `UDA_ERR_INVALID_ARGUMENT`
+/// because it would render an invisible row.
 #[no_mangle]
 pub unsafe extern "C" fn uda_tray_menu_add_text(
     menu_handle: u64,
@@ -906,14 +957,11 @@ pub extern "C" fn uda_tray_menu_add_separator(menu_handle: u64) -> i32 {
 
 /// Append a checkbox row to a menu.
 ///
-/// The row's stored value is inverted *before* `callback` runs, so the
-/// `checked` argument is the new state the shell will render and the menu
-/// cannot drift out of sync with it. `checked` is 0 to start unchecked, any
-/// other value to start checked. `callback` is invoked on the tray worker
-/// thread when the row is toggled, or NULL for a silent row. `label` must be
-/// non-blank: a blank label is rejected with `UDA_ERR_NOT_SUPPORTED`.
-///
-/// On success `*out_item_id` receives the row's stable, non-zero id.
+/// When a `callback` is supplied, the row's own stored value is inverted *before*
+/// it runs, so the `checked` argument is the new state the shell will render.
+/// A null callback installs no handler at all: the row renders with its initial
+/// state and never toggles, which is what a host that drives the checkbox
+/// through its own UI wants.
 ///
 /// # Safety
 ///
@@ -951,8 +999,9 @@ pub unsafe extern "C" fn uda_tray_menu_add_checkbox(
 /// Attach a menu to a tray icon, replacing any menu set earlier.
 ///
 /// The menu handle stays valid after this call: the icon holds its own
-/// reference, so destroying the menu afterwards is optional and does not
-/// clear the rows.
+/// reference, so the menu keeps working whether or not the handle is destroyed
+/// later. Destroying the handle (see [`uda_tray_menu_destroy`]) detaches the
+/// menu from every icon still showing it.
 #[no_mangle]
 pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> i32 {
     util::catch_boundary(|| tray::set_menu(tray_handle, menu_handle))
@@ -960,10 +1009,16 @@ pub extern "C" fn uda_tray_set_menu(tray_handle: u64, menu_handle: u64) -> i32 {
 
 /// Destroy a menu handle.
 ///
-/// Safe to call after `uda_tray_set_menu()`, as documented there. Terminal:
-/// the handle cannot be reused afterwards. Returns
-/// `UDA_ERR_INVALID_ARGUMENT` when the handle is not a live menu in this
-/// process.
+/// The menu is detached from **every** tray icon that still shows it, so its
+/// rows and callbacks stop firing (a snapshot a backend already cloned stays
+/// silent instead of calling the host); the icons themselves stay alive and
+/// simply have no menu afterwards. This makes destroying a menu handle safe
+/// even when the host has already attached it. Terminal: the handle cannot be
+/// reused afterwards. Returns `UDA_ERR_INVALID_ARGUMENT` when the handle is not
+/// a live menu, and `UDA_ERR_INTERNAL` while one of the menu's callbacks is
+/// still running - the menu stays fully intact then, so a host that waits for
+/// its own callback to return and retries will succeed; the host may free its
+/// callback trampolines only after this call reports success.
 #[no_mangle]
 pub extern "C" fn uda_tray_menu_destroy(menu_handle: u64) -> i32 {
     util::catch_boundary(|| tray::destroy_menu(menu_handle))
@@ -988,9 +1043,19 @@ fn owned_or_empty(pointer: *const c_char, parameter: &str) -> Result<String, err
 /// `None` means the player did not publish the field and maps to NULL; a
 /// published value - including an empty one - maps to a real string, so a
 /// host can tell "published empty" from "not published".
+///
+/// This deliberately does not go through [`util::c_string_from`]: that helper
+/// folds an empty string into null, honouring the C ABI's "empty means absent"
+/// convention for the other exports. A media field needs the two cases kept
+/// apart, so an empty published value allocates a real, zero-length C string.
 fn c_string_or_null(text: Option<&str>) -> *mut c_char {
     match text {
-        Some(text) => util::c_string_from(text),
+        // The only failure is an interior NUL, which no backend can produce;
+        // reporting it as "not published" is still the correct C answer.
+        Some(text) => match std::ffi::CString::new(text) {
+            Ok(c_string) => c_string.into_raw(),
+            Err(_) => std::ptr::null_mut(),
+        },
         None => std::ptr::null_mut(),
     }
 }
@@ -1002,7 +1067,7 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-/// Map a C fill-mode code onto the cross-platform [`FillMode`].
+/// Map a C fill-mode code onto the cross-platform [`FillMode`](uda_core::wallpaper::FillMode).
 fn fill_mode_from_c(code: i32) -> Result<uda_core::wallpaper::FillMode, error::Failure> {
     use uda_core::wallpaper::FillMode;
     let fill_mode = match code {
@@ -1019,7 +1084,7 @@ fn fill_mode_from_c(code: i32) -> Result<uda_core::wallpaper::FillMode, error::F
     Ok(fill_mode)
 }
 
-/// Map a C wake-lock code onto the cross-platform [`WakeLockType`].
+/// Map a C wake-lock code onto the cross-platform [`WakeLockType`](uda_core::wakelock::WakeLockType).
 fn wake_lock_type_from_c(code: i32) -> Result<uda_core::wakelock::WakeLockType, error::Failure> {
     use uda_core::wakelock::WakeLockType;
     let lock_type = match code {
@@ -1048,7 +1113,7 @@ mod tests {
         // other library string.
         let pointer = c_string_or_null(Some(""));
         assert!(!pointer.is_null());
-        // SAFETY: the pointer came from `c_string_from` in this test.
+        // SAFETY: the pointer came from `c_string_or_null` in this test.
         let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
             .to_str()
             .expect("empty string is valid UTF-8");
@@ -1058,7 +1123,7 @@ mod tests {
         // Published text -> the text, read back verbatim.
         let pointer = c_string_or_null(Some("/music/track.flac"));
         assert!(!pointer.is_null());
-        // SAFETY: the pointer came from `c_string_from` in this test.
+        // SAFETY: the pointer came from `c_string_or_null` in this test.
         let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
             .to_str()
             .expect("the path is valid UTF-8");
@@ -1147,6 +1212,12 @@ mod tests {
         let mut theme: i32 = -100;
         // SAFETY: `theme` is a live, writable `int32_t` on this stack frame.
         let status = unsafe { uda_detect_theme(&mut theme) };
+        if status == UDA_ERR_NOT_SUPPORTED {
+            // A host with no appearance backend (e.g. macOS, where this crate
+            // ships no backend) answers -2 before touching the slot; the same
+            // early-out the wake-lock round trip uses.
+            return;
+        }
         assert_eq!(status, UDA_OK);
         assert!((0..=2).contains(&theme), "unexpected theme {theme}");
     }
@@ -1351,5 +1422,165 @@ mod tests {
         // Whatever the platform reports, a zeroed slot is the documented
         // "no accent colour" answer and must not be mistaken for a failure.
         let _ = rgba;
+    }
+
+    #[test]
+    fn tray_capabilities_reject_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_tray_capabilities(std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    #[test]
+    fn tray_capabilities_report_only_documented_bits() {
+        let mut bits: u32 = 0;
+        // SAFETY: `bits` is a live, writable `uint32_t` on this stack frame.
+        let status = unsafe { uda_tray_capabilities(&mut bits) };
+        assert_eq!(status, UDA_OK);
+
+        // The C ABI has no click-callback registration, so those bits are
+        // deliberately cleared even when the platform backend can measure
+        // clicks.
+        const UNDELIVERABLE_BY_C_ABI: u32 = UDA_TRAY_CAP_CLICK | UDA_TRAY_CAP_DOUBLE_CLICK;
+        assert_eq!(
+            bits & UNDELIVERABLE_BY_C_ABI,
+            0,
+            "the C ABI delivers activation only through menu rows: {bits:#x}"
+        );
+
+        // Every other bit must forward the backend's answer verbatim.
+        assert_eq!(bits, tray::capabilities().bits() & !UNDELIVERABLE_BY_C_ABI);
+        assert_eq!(
+            bits & !abi::DOCUMENTED_TRAY_CAPABILITIES,
+            0,
+            "undocumented tray capability bits: {bits:#x}"
+        );
+        if !cfg!(any(target_os = "linux", target_os = "windows")) {
+            assert_eq!(bits, 0, "a target with no tray backend must report 0");
+        }
+    }
+
+    #[test]
+    fn tray_support_level_rejects_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_tray_support_level(1, std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    #[test]
+    fn tray_support_reason_rejects_a_null_out_parameter() {
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_tray_support_reason(1, std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+        assert!(util::take_last_message().is_some());
+    }
+
+    /// The exports the C ABI presents as plain `extern "C"` (no `unsafe`).
+    /// Every argument they take is a value - a numeric handle, a status code -
+    /// that the library handles as data: a garbage value produces an error,
+    /// never undefined behaviour, so a Rust caller may call them without an
+    /// `unsafe` block.
+    ///
+    /// The list pins the classification rather than deriving it: the media
+    /// command and session control exports also take only values, yet they are
+    /// `unsafe`, as they have been since v0.2.0. Conversely every export that
+    /// takes a raw pointer is `unsafe`, because a dangling non-null pointer is
+    /// UB that a safe signature cannot accept. Reclassifying an export either
+    /// way is a compatibility decision: update this list and the changelog
+    /// together.
+    const PLAIN_EXTERN_C_EXPORTS: &[&str] = &[
+        "uda_last_error_message",
+        "uda_status_message",
+        "uda_tray_destroy",
+        "uda_tray_menu_add_separator",
+        "uda_tray_menu_destroy",
+        "uda_tray_set_menu",
+        "uda_tray_set_visible",
+        "uda_wakelock_release",
+    ];
+
+    #[test]
+    fn export_safety_classification_is_pinned() {
+        // The safe/unsafe split of the C ABI surface is a compatibility
+        // contract: Rust hosts that link the dylib see it, and a silent
+        // reclassification (an export drifting between `extern "C"` and
+        // `unsafe extern "C"`) is exactly the kind of surprise change a
+        // downstream build cannot absorb. This pins the split; reclassifying an
+        // export is a deliberate decision that must update this list and the
+        // changelog together.
+        let source = include_str!("lib.rs");
+        let mut plain: Vec<&str> = Vec::new();
+        let mut unsafe_exports: Vec<&str> = Vec::new();
+        for line in source.lines() {
+            let line = line.trim_start();
+            let (bucket, signature) =
+                if let Some(rest) = line.strip_prefix("pub unsafe extern \"C\" fn ") {
+                    (&mut unsafe_exports, rest)
+                } else if let Some(rest) = line.strip_prefix("pub extern \"C\" fn ") {
+                    (&mut plain, rest)
+                } else {
+                    continue;
+                };
+            // rustfmt keeps `fn NAME(` on one line even when it wraps the
+            // parameter list, so the name ends at the first `(`.
+            let end = signature.find('(').unwrap_or(signature.len());
+            bucket.push(&signature[..end]);
+        }
+
+        plain.sort_unstable();
+        let mut expected = PLAIN_EXTERN_C_EXPORTS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(
+            plain, expected,
+            "the plain export set drifted; update PLAIN_EXTERN_C_EXPORTS and the changelog together"
+        );
+
+        unsafe_exports.sort_unstable();
+        // No export may appear in both sets, and every export not listed as
+        // plain must be `unsafe`: a pointer-taking export classified safe would
+        // let a Rust caller pass a dangling pointer without any unsafe block,
+        // which is unsound.
+        assert!(unsafe_exports.iter().all(|name| !plain.contains(name)));
+        assert_eq!(
+            unsafe_exports.len() + plain.len(),
+            35,
+            "the export count changed; the classification list must follow"
+        );
+    }
+
+    #[test]
+    fn last_error_message_returns_a_caller_owned_allocation() {
+        let _ = util::take_last_message();
+        // SAFETY: passing null is exactly the case under test.
+        let status = unsafe { uda_detect_theme(std::ptr::null_mut()) };
+        assert_eq!(status, UDA_ERR_INVALID_ARGUMENT);
+
+        let pointer = uda_last_error_message();
+        assert!(
+            !pointer.is_null(),
+            "a failure must leave a readable message"
+        );
+
+        // SAFETY: the pointer is a live library allocation owned by this test
+        // until it is released below.
+        let text = unsafe { std::ffi::CStr::from_ptr(pointer) }
+            .to_str()
+            .expect("the message is valid UTF-8");
+        assert!(text.contains("out_theme"), "got: {text}");
+
+        // Reading consumed the message: an immediate second call with no new
+        // failure reports "nothing recorded".
+        assert!(
+            uda_last_error_message().is_null(),
+            "the message slot must be empty after a successful read"
+        );
+
+        // Ownership moved to the caller: released through the export that frees
+        // every other returned string.
+        // SAFETY: the pointer came from `uda_last_error_message` above and has
+        // not been released yet.
+        unsafe { uda_free_string(pointer) };
     }
 }

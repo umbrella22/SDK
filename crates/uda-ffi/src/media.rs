@@ -4,12 +4,12 @@
 //! [`MediaManager`](uda_core::media::MediaManager) trait does: read what is
 //! playing, read the playback status, and send a transport command. The status is
 //! an `int32_t` code (see [`PlaybackStatus::code`](uda_core::media::PlaybackStatus));
-//! the metadata crosses the boundary as three separately-owned strings plus out
-//! duration and position slots, because a C caller cannot allocate a Rust struct.
+//! the metadata crosses the boundary as three separately-owned strings plus an
+//! out duration, because a C caller cannot allocate a Rust struct.
 //!
 //! # Why an out-code instead of an out-pointer for the status
 //!
-//! [`uda_media_get_status`] writes into a caller-supplied `int32_t` rather than
+//! `uda_media_get_status` writes into a caller-supplied `int32_t` rather than
 //! returning the code, so the return value stays free to report *hard* failures
 //! (status `-2` when the platform has no media backend at all). A "no player is
 //! running" is **not** a failure: it is reported as `UDA_MEDIA_UNKNOWN` (3) with
@@ -18,18 +18,21 @@
 //!
 //! # Ownership
 //!
-//! The three strings written by [`uda_media_get_metadata`] are allocated by Rust
+//! The three strings written by `uda_media_get_metadata` are allocated by Rust
 //! and must be released with [`uda_free_string`](crate::uda_free_string); they
-//! are null when the player does not publish the corresponding field, which is
-//! the normal case for a player that publishes only a title.
+//! may be null when the corresponding field is empty, which is the normal case
+//! for a player that publishes only a title.
 //!
-//! A machine with nobody to command reports
-//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED). Any
-//! non-`UDA_OK` status means success was not confirmed. After a timeout or
-//! communication failure, the player may already have executed the command;
-//! do not blindly retry commands such as Next or Toggle, which can act twice.
+//! A refused command (an app that disables `Next`, for example) returns
+//! [`UDA_ERR_NOT_SUPPORTED`](crate::abi::UDA_ERR_NOT_SUPPORTED) so a caller can
+//! tell "there was nobody to command" from "the player declined it".
 
-use uda_core::media::{MediaCommand, MediaManager, MediaMetadata, PlaybackStatus};
+use uda_core::media::{MediaCommand, MediaMetadata, PlaybackStatus};
+// `active_metadata` and friends call trait methods on the platform managers;
+// the placeholder branches below answer without the trait, so an unconditional
+// import would be unused (and warned about) on those targets.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use uda_core::media::MediaManager as _;
 
 use crate::error::Failure;
 
@@ -124,6 +127,7 @@ mod tests {
         UDA_MEDIA_CMD_STOP, UDA_MEDIA_CMD_TOGGLE, UDA_MEDIA_PAUSED, UDA_MEDIA_PLAYING,
         UDA_MEDIA_STOPPED, UDA_MEDIA_UNKNOWN,
     };
+    use uda_core::error::UdaError;
 
     #[test]
     fn command_codes_match_the_c_header() {
@@ -174,6 +178,15 @@ mod tests {
         // rather than an error, and on a real desktop it returns whatever is
         // playing. Either branch must be usable without unwrapping.
         let result = active_metadata();
+        if let Err(Failure::Uda(UdaError::NotSupported(message))) = &result {
+            // A target with no media backend at all answers `-2` before any
+            // player lookup; nothing else is acceptable here.
+            assert!(
+                message.contains("no media backend"),
+                "message was: {message}"
+            );
+            return;
+        }
         assert!(
             result.is_ok(),
             "a missing player is not an error: {result:?}"
